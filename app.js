@@ -79,6 +79,7 @@
     focusId = null;
     selectedId = null;
     nextId = 0;
+    chosen = null;
     (function walk(node, parent) {
       node.id = "n" + nextId++;
       index.set(node.id, { node, parent });
@@ -211,7 +212,7 @@
         let e = key && humanByClient.get(key);
         if (e) humanByClient.delete(key);
         else { rec.human++; e = addEntry(id, { kind: "human", text: evt.text || "", author: evt.author, mode: evt.mode, clientId: evt.client_msg_id }); }
-        Object.assign(e, { status: "queued", messageId: evt.message_id, start: ms(evt.started_at), ts: ms(evt.started_at), error: null });
+        Object.assign(e, { status: "queued", messageId: evt.message_id, start: ms(evt.started_at), ts: ms(evt.started_at), error: null, broadcastId: evt.broadcast_id, broadcastSize: evt.broadcast_size });
         e.ver++;
         if (evt.message_id) humanById.set(evt.message_id, e);
       } else {
@@ -269,6 +270,7 @@
     dirty.clear();
     updateStats();
     updateWaiting();
+    if (live) (view === "trace" ? traceComposer : treeComposer).update(); // recipients' statuses may have changed
   }
 
   // ---------- header ----------
@@ -329,6 +331,7 @@
     row.className = `node st-${rec.status}`;
     row.dataset.id = node.id;
     if (node.id === selectedId) row.classList.add("selected");
+    if (chosen && chosen.has(node.id)) row.classList.add("recipient");
     if (opts.hits && opts.hits.has(node.id)) row.classList.add("hit");
 
     const meta = node.model || node.evaluator || node.selector || node.endCondition || node.mode || "";
@@ -566,7 +569,7 @@
       const st = HUMAN_STATE[e.status] || HUMAN_STATE.queued;
       el.classList.toggle("failed", e.status === "failed");
       el.innerHTML = who(e) +
-        `<div class="h-head">💬 <strong></strong> <span class="pill st-${st.dot}"${st.title ? ` title="${st.title}"` : ""}><span class="dot"></span>${st.label}</span>` +
+        `<div class="h-head">💬 <strong></strong>${e.broadcastSize > 1 ? ` <span class="muted">to ${e.broadcastSize} agents</span>` : ""} <span class="pill st-${st.dot}"${st.title ? ` title="${st.title}"` : ""}><span class="dot"></span>${st.label}</span>` +
         (e.start && e.end ? ` <span class="muted">after ${fmtDur(e.end - e.start)}</span>` : "") + ` <span class="h-err"></span></div><p class="txt"></p>`;
       el.querySelector("strong").textContent = authorLabel(e);
       el.querySelector(".h-err").textContent = e.error || "";
@@ -620,6 +623,7 @@
   treeEl.addEventListener("click", (e) => {
     const row = e.target.closest(".node");
     if (!row) return;
+    if ((e.metaKey || e.ctrlKey) && !e.target.closest(".chev") && toggleRecipient(row.dataset.id)) { e.preventDefault(); return; }
     if (!e.target.closest(".chev")) e.preventDefault(); // click row = select; chevron = expand
     if (row.dataset.id !== selectedId) showPanel(row.dataset.id);
   });
@@ -796,7 +800,8 @@
   function spanRow(s, i) {
     const row = document.createElement("div");
     const open = s.children.length ? isOpen(s) : null;
-    row.className = `span st-${s.status}` + (s.id === traceSel ? " selected" : "") + (traceHits && traceHits.has(s.id) ? " hit" : "");
+    row.className = `span st-${s.status}` + (s.id === traceSel ? " selected" : "") + (traceHits && traceHits.has(s.id) ? " hit" : "") +
+      (chosen && chosen.has(s.id) ? " recipient" : "");
     row.style.top = i * ROW_H + "px";
     row.dataset.id = s.id;
     row.setAttribute("role", "treeitem");
@@ -893,7 +898,10 @@
 
   function inputOf(s) {
     if (s.kind === "tool") return s.entry.args != null ? [{ label: "Arguments", value: s.entry.args }] : [];
-    if (s.kind === "human") return [{ label: `Message from ${authorLabel(s.entry)}`, value: s.entry.text }];
+    if (s.kind === "human") {
+      const n = s.entry.broadcastSize;
+      return [{ label: `Message from ${authorLabel(s.entry)}${n > 1 ? ` to ${n} agents` : ""}`, value: s.entry.text }];
+    }
     if (s.kind === "pause") {
       const e = s.entry;
       const out = [{ label: "Request", value: e.prompt }, { label: `Tool call · ${e.toolName || "tool"}`, value: e.toolArgs ?? "(no arguments)" }];
@@ -998,7 +1006,12 @@
     add(human ? (e.status === "expired" ? "expired" : "delivered") : "completed", iso(s.end));
     if (s.kind === "reasoning") add("steps", e.steps.length);
     add("tool call id", e.callId);
-    if (human) { add("message id", e.messageId); add("client id", e.clientId); add("error", e.error); }
+    if (human) {
+      if (e.broadcastSize > 1) add("broadcast", `${e.broadcastId || "sending"} · ${e.broadcastSize} agents`);
+      add("message id", e.messageId);
+      add("client id", e.clientId);
+      add("error", e.error);
+    }
     const node = index.get(s.nodeId).node;
     add("node", `${node.name} (${node.type})`);
     if (node.model_name || node.model) add("model", node.model_name || node.model);
@@ -1102,6 +1115,7 @@
     const s = spans.get(row.dataset.id);
     if (!s) return;
     if (e.target.closest(".chev") && s.children.length) { toggleSpan(s); return; }
+    if ((e.metaKey || e.ctrlKey) && s.kind === "node" && toggleRecipient(s.id)) return;
     spanScroll.focus({ preventScroll: true });
     if (s.id !== traceSel) selectSpan(s.id);
   });
@@ -1184,7 +1198,7 @@
   // trace replaces the streamed one, keeping selection, focus and open groups (reload).
 
   const LIVE_TICK_MS = 1000;      // how often running bars grow in the trace view between events
-  const LIVE_PASS = ["speed", "jitter", "drop", "pauses"]; // page query params forwarded to the mock server
+  const LIVE_PASS = ["speed", "jitter", "drop", "pauses", "parallel"]; // page query params forwarded to the mock server
   const LIVE_LABEL = { connecting: "Connecting…", live: "Live", reconnecting: "Reconnecting…", completed: "Run complete", error: "Disconnected" };
   const LIVE_DOT = { connecting: "pending", live: "running", reconnecting: "pending", completed: "done", error: "failed" };
   const structural = new Set();   // nodes that gained children since the last flush
@@ -1198,6 +1212,7 @@
     const pass = new URLSearchParams();
     LIVE_PASS.forEach((k) => { if (q.has(k)) pass.set(k, q.get(k)); });
     if (!pass.has("pauses")) pass.set("pauses", "1"); // the demo shows approvals unless ?pauses=0
+    if (!pass.has("parallel")) pass.set("parallel", "1"); // ...and two agents at once unless ?parallel=0
     return `/runs/demo-${Date.now().toString(36)}/events` + (pass.size ? "?" + pass : "");
   }
 
@@ -1346,6 +1361,7 @@
       traceOpen: [...traceOpen].map(toTrace),
       traceSel: spanTo(traceSel),
       hits: traceHits && [...traceHits].map(spanTo),
+      chosen: chosen && [...chosen].map(toTrace),
       treeScroll: treeWrap.scrollTop,
       spanScroll: spanScroll.scrollTop,
     };
@@ -1356,6 +1372,7 @@
     traceOpen = new Set(saved.traceOpen.map(back).filter(Boolean));
     traceSel = spanBack(saved.traceSel);
     traceHits = saved.hits && new Set(saved.hits.map(spanBack).filter(Boolean));
+    chosen = saved.chosen && new Set(saved.chosen.map(back).filter(Boolean));
     render({ openIds: new Set(saved.treeOpen.map(back).filter(Boolean)) });
     treeWrap.scrollTop = saved.treeScroll;
     if (view === "trace") {
@@ -1387,16 +1404,66 @@
   }
   const authorLabel = (e) => (e.author && e.author === viewerName() ? "You" : e.author || "Someone");
 
-  // undefined: no message box (not live, or not an agent); a string: disabled, with that
-  // reason; null: can send.
-  function steerBlocker(id) {
+  // ----- recipients -----
+  // By default a message goes to the selected agent or, when a step or other group is selected,
+  // to the agents running under it. Picking agents (the "Change" list, or Ctrl/⌘-click on rows)
+  // switches to a chosen set, shared by both views, until "Reset". Recipients are fixed when you
+  // press Send: an agent that starts afterwards doesn't get the message.
+
+  let chosen = null; // Set of internal node ids picked by hand, or null for the default
+
+  const reachable = (id) => { const st = records.get(id)?.status; return st === "running" || st === "waiting"; };
+  const isAgent = (id) => STEERABLE.has(index.get(id)?.node.type);
+  const allAgents = () => [...index.keys()].filter(isAgent);
+  function agentsUnder(id) {
+    const out = [];
+    (function walk(n) { (n.children || []).forEach((k) => { if (STEERABLE.has(k.type)) out.push(k.id); walk(k); }); })(index.get(id).node);
+    return out;
+  }
+
+  // Who a message from the panel showing node `id` would go to.
+  function audience(id) {
+    if (chosen) return { kind: "chosen", ids: [...chosen] };
     const entry = id && index.get(id);
-    if (!live || !entry || !STEERABLE.has(entry.node.type)) return undefined;
-    if (live.done) return "The run has finished.";
-    const st = records.get(id).status;
-    if (st === "pending") return "This agent hasn't started yet.";
-    if (st !== "running" && st !== "waiting") return "This agent has finished; messages only reach running agents.";
-    return null;
+    if (!entry) return { kind: null, ids: [] };
+    if (STEERABLE.has(entry.node.type)) return { kind: "agent", ids: [id] };
+    const under = agentsUnder(id);
+    return under.length ? { kind: "group", ids: under.filter(reachable), scope: entry.node.name } : { kind: null, ids: [] };
+  }
+
+  // { hidden } when there's no message box; { reason } when it is shown disabled; else { targets }.
+  function sendState(id) {
+    const aud = audience(id);
+    if (!live || !aud.kind) return { hidden: true, aud };
+    if (live.done) return { reason: "The run has finished.", aud };
+    const targets = aud.ids.filter(reachable);
+    if (targets.length) return { targets, aud };
+    if (aud.kind === "agent") {
+      return { aud, reason: records.get(id).status === "pending" ? "This agent hasn't started yet." : "This agent has finished; messages only reach running agents." };
+    }
+    if (aud.kind === "group") return { aud, reason: `No agents are running under ${aud.scope}.` };
+    return { aud, reason: aud.ids.length ? "None of the chosen agents are running." : "Choose at least one agent." };
+  }
+
+  function choose(update) {
+    if (!chosen) chosen = new Set(audience(selectedId).ids);
+    update(chosen);
+    audienceChanged();
+  }
+  function resetAudience() { chosen = null; audienceChanged(); }
+
+  // Ctrl/⌘-click on an agent row adds or removes it.
+  function toggleRecipient(id) {
+    if (!live || live.done || !isAgent(id)) return false;
+    choose((set) => (set.has(id) ? set.delete(id) : set.add(id)));
+    return true;
+  }
+
+  function audienceChanged() {
+    treeComposer.update();
+    traceComposer.update();
+    treeEl.querySelectorAll(".node[data-id]").forEach((el) => el.classList.toggle("recipient", !!chosen && chosen.has(el.dataset.id)));
+    if (view === "trace") renderWindow();
   }
 
   // Other endpoints of the live run sit next to its stream: <run>/events -> <run>/<path>.
@@ -1407,68 +1474,179 @@
     return u.toString();
   }
 
-  function drawNow(id) {
-    dirty.add(id);
+  function drawNow(...ids) {
+    ids.forEach((id) => dirty.add(id));
     if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
     flush();
   }
 
-  async function sendHuman(nodeId, text) {
-    const node = index.get(nodeId).node;
+  // Sends one message to `ids` (a broadcast when there are several). Each agent gets its own
+  // entry at once; the server's echo confirms each, and agents that finished in the meantime
+  // come back as skipped. Resolves to { sent, skipped }.
+  async function sendHuman(ids, text) {
     const clientId = "c_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
     const now = Date.now() + live.skew;
-    records.get(nodeId).human++;
-    const e = addEntry(nodeId, { kind: "human", text, author: viewerName(), mode: "steer", clientId, status: "sending", start: now, ts: now });
-    humanByClient.set(`${clientId}|${nodeId}`, e);
-    drawNow(nodeId);
+    const made = ids.map((id) => {
+      records.get(id).human++;
+      const e = addEntry(id, { kind: "human", text, author: viewerName(), mode: "steer", clientId, status: "sending", start: now, ts: now, broadcastSize: ids.length > 1 ? ids.length : null });
+      humanByClient.set(`${clientId}|${id}`, e);
+      return e;
+    });
+    drawNow(...ids);
+    const fail = (e, reason) => { if (e.status === "sending") { e.status = "failed"; e.error = reason; e.ver++; dirty.add(e.nodeId); } };
+    let body;
     try {
       const r = await fetch(liveEndpoint("messages"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ targets: [node.traceId], text, mode: "steer", client_msg_id: clientId, author: viewerName() }),
+        body: JSON.stringify({ targets: ids.map((id) => index.get(id).node.traceId), text, mode: "steer", client_msg_id: clientId, author: viewerName() }),
       });
-      if (!r.ok) throw new Error((await r.json().catch(() => null))?.error || `HTTP ${r.status}`);
+      body = await r.json().catch(() => null);
+      if (!r.ok) throw new Error(body?.error || `HTTP ${r.status}`);
     } catch (err) {
-      const reason = err instanceof TypeError ? "Couldn't reach the server." : err.message; // fetch's network errors are TypeErrors
-      if (e.status === "sending") { e.status = "failed"; e.error = reason; e.ver++; drawNow(nodeId); }
+      const reason = errText(err);
+      made.forEach((e) => fail(e, reason));
+      drawNow();
       throw new Error(reason);
     }
+    const skipped = new Map((body.skipped || []).map((x) => [x.node_id, x.reason]));
+    made.forEach((e) => {
+      const reason = skipped.get(index.get(e.nodeId)?.node.traceId);
+      if (reason) fail(e, "Skipped: " + reason);
+    });
+    if (skipped.size) drawNow();
+    return { sent: (body.messages || []).length, skipped: skipped.size };
   }
+
+  const CHIP_LIMIT = 4; // more recipients than this collapse into "+N more"
 
   function createComposer() {
     const el = document.createElement("form");
     el.className = "composer";
     el.hidden = true;
     el.innerHTML =
-      `<label class="composer-label"></label><textarea rows="2" maxlength="${HUMAN_MAX}"></textarea>` +
-      `<div class="composer-row"><span class="composer-note muted"></span><button type="submit" class="primary">Send</button></div>`;
-    const label = el.querySelector("label");
-    const ta = el.querySelector("textarea");
-    const note = el.querySelector(".composer-note");
-    const btn = el.querySelector("button");
+      `<div class="composer-head"><label class="composer-label">Message</label><span class="muted">to</span>` +
+      `<span class="chips"></span><button type="button" class="linkish pick">Change</button>` +
+      `<button type="button" class="linkish reset" hidden>Reset</button></div>` +
+      `<div class="picker" hidden><div class="picker-actions"><button type="button" data-act="running">All running</button>` +
+      `<button type="button" data-act="none">None</button></div><ul class="picker-list"></ul>` +
+      `<p class="muted picker-tip">Tip: Ctrl/⌘-click agents in the tree or trace to add or remove them.</p></div>` +
+      `<textarea rows="2" maxlength="${HUMAN_MAX}"></textarea>` +
+      `<div class="composer-row"><span class="composer-note muted"></span><button type="submit" class="primary send">Send</button></div>`;
+    const $$ = (sel) => el.querySelector(sel);
+    const ta = $$("textarea"), note = $$(".composer-note"), btn = $$(".send"), chips = $$(".chips");
+    const picker = $$(".picker"), list = $$(".picker-list"), pickBtn = $$(".pick"), resetBtn = $$(".reset");
     ta.id = "composer-" + Math.random().toString(36).slice(2, 8);
-    label.htmlFor = ta.id;
-    let target = null, blocked, error = "";
-    const key = (id = target) => index.get(id)?.node.traceId || id;
+    $$("label").htmlFor = ta.id;
+    let target = null, st = { hidden: true }, error = "", flash = "", listSig = "";
+    const key = () => {
+      if (st.aud?.kind === "chosen") return "chosen";
+      const t = index.get(target)?.node.traceId || target;
+      return st.aud?.kind === "group" ? "under:" + t : t;
+    };
+
+    function drawChips() {
+      const ids = st.aud.kind === "chosen" ? st.aud.ids : st.aud.ids.length ? st.aud.ids : [];
+      chips.replaceChildren();
+      if (!ids.length) {
+        const none = document.createElement("span");
+        none.className = "muted";
+        none.textContent = st.aud.kind === "group" ? `running agents under ${st.aud.scope}` : "no one";
+        chips.append(none);
+        return;
+      }
+      ids.slice(0, CHIP_LIMIT).forEach((id) => {
+        const chip = document.createElement("span");
+        chip.className = `chip st-${records.get(id).status}`;
+        chip.innerHTML = `<span class="dot"></span><span class="nm"></span>`;
+        chip.querySelector(".nm").textContent = index.get(id).node.name;
+        chip.title = `${index.get(id).node.name} · ${records.get(id).status}`;
+        if (st.aud.kind === "chosen") {
+          const x = document.createElement("button");
+          x.type = "button";
+          x.className = "chip-x";
+          x.setAttribute("aria-label", `Remove ${index.get(id).node.name}`);
+          x.textContent = "×";
+          x.addEventListener("click", () => choose((set) => set.delete(id)));
+          chip.append(x);
+        }
+        chips.append(chip);
+      });
+      if (ids.length > CHIP_LIMIT) {
+        const more = document.createElement("button");
+        more.type = "button";
+        more.className = "linkish";
+        more.textContent = `+${ids.length - CHIP_LIMIT} more`;
+        more.addEventListener("click", () => { picker.hidden = false; update(); });
+        chips.append(more);
+      }
+    }
+
+    // The checklist is only rebuilt when what it shows changes, so keyboard focus survives redraws.
+    function drawList() {
+      const inSet = new Set(st.aud.ids);
+      const agents = allAgents();
+      const sig = agents.map((id) => `${id}:${inSet.has(id) ? 1 : 0}:${records.get(id).status}`).join(",");
+      if (sig === listSig) return;
+      listSig = sig;
+      list.replaceChildren(...agents.map((id) => {
+        const li = document.createElement("li");
+        const label = document.createElement("label");
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = inSet.has(id);
+        cb.disabled = !reachable(id) && !cb.checked;
+        cb.addEventListener("change", () => choose((set) => (cb.checked ? set.add(id) : set.delete(id))));
+        const status = records.get(id).status;
+        label.className = `st-${status}`;
+        label.append(cb);
+        label.insertAdjacentHTML("beforeend", `<span class="dot"></span><span class="nm"></span><span class="muted">${status === "done" ? "finished" : status}</span>`);
+        label.querySelector(".nm").textContent = index.get(id).node.name;
+        li.append(label);
+        return li;
+      }));
+    }
 
     function update(id = target) {
-      if (id !== target) { target = id; error = ""; }
-      blocked = steerBlocker(target);
-      el.hidden = blocked === undefined;
-      if (el.hidden) return;
+      if (id !== target) { target = id; error = ""; flash = ""; }
+      st = sendState(target);
+      el.hidden = !!st.hidden;
+      if (el.hidden) { picker.hidden = true; return; }
       if (document.activeElement !== ta) ta.value = drafts.get(key()) || "";
-      label.textContent = `Message ${index.get(target).node.name}`;
-      ta.disabled = !!blocked;
-      ta.placeholder = blocked || "Steer this agent… Enter to send, Shift+Enter for a new line";
-      btn.disabled = !!blocked || !ta.value.trim();
-      note.textContent = error || (blocked ? "" : records.get(target).status === "waiting"
-        ? "This agent is paused; it reads your message after it continues." : "The agent reads it at its next step.");
+      drawChips();
+      resetBtn.hidden = st.aud.kind !== "chosen";
+      pickBtn.setAttribute("aria-expanded", !picker.hidden);
+      pickBtn.disabled = !!live.done;
+      if (!picker.hidden) drawList(); else listSig = "";
+      const n = st.targets ? st.targets.length : 0;
+      ta.disabled = !!st.reason;
+      ta.setAttribute("aria-label", n > 1 ? `Message to ${n} agents` : "Message");
+      ta.placeholder = st.reason || (n > 1 ? `Message ${n} agents… ` : "Steer this agent… ") + "Enter to send, Shift+Enter for a new line";
+      btn.disabled = !!st.reason || !ta.value.trim();
+      btn.textContent = n > 1 ? `Send to ${n}` : "Send";
+      let hint = "";
+      if (!st.reason) {
+        const off = st.aud.ids.length - n;
+        hint = (n > 1 ? "Each agent gets its own copy and reads it at its next step."
+          : records.get(st.targets[0]).status === "waiting" ? "This agent is paused; it reads your message after it continues."
+          : "The agent reads it at its next step.") +
+          (off ? ` ${off} chosen agent${off === 1 ? " isn't" : "s aren't"} running and won't get it.` : "");
+      }
+      note.textContent = error || flash || hint;
       note.classList.toggle("err", !!error);
     }
 
+    pickBtn.addEventListener("click", () => { picker.hidden = !picker.hidden; update(); });
+    resetBtn.addEventListener("click", resetAudience);
+    picker.addEventListener("click", (e) => {
+      const act = e.target.closest("[data-act]")?.dataset.act;
+      if (act === "running") { chosen = new Set(allAgents().filter(reachable)); audienceChanged(); }
+      else if (act === "none") { chosen = new Set(); audienceChanged(); }
+    });
     ta.addEventListener("input", () => {
       if (ta.value) drafts.set(key(), ta.value); else drafts.delete(key());
       error = "";
+      flash = "";
       update();
     });
     ta.addEventListener("keydown", (e) => {
@@ -1477,14 +1655,19 @@
     el.addEventListener("submit", (e) => {
       e.preventDefault();
       const text = ta.value.trim();
-      if (!text || blocked !== null) return;
-      const to = target, k = key();
+      if (!text || !st.targets) return;
+      const to = st.targets, k = key(), from = target;
       ta.value = "";
       drafts.delete(k);
       update();
-      sendHuman(to, text).catch((err) => {
+      sendHuman(to, text).then(({ sent, skipped }) => {
+        if (skipped && target === from) {
+          flash = `Sent to ${sent}; skipped ${skipped} that had finished.`;
+          update();
+        }
+      }).catch((err) => {
         if (!drafts.get(k)) drafts.set(k, text); // give the text back so it can be resent
-        if (target === to) {
+        if (target === from) {
           if (!ta.value) ta.value = text;
           error = `Not sent: ${err.message}`;
           update();

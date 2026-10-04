@@ -10,8 +10,11 @@
 //                              jitter=1  send some nodes' start late, after their first events
 //                              drop=N    close the connection after N events (tests reconnect)
 //                              pauses=1  pause agents before a tool call for approval or input
-//   POST /runs/:id/messages  steer running agents: { targets: [node_id], text, mode?: "steer",
-//                            client_msg_id?, author? } -> 202 { messages: [{ message_id, node_id }] }
+//                              parallel=1  run the two expert branches at the same time
+//   POST /runs/:id/messages  steer running agents: { targets: [node_id, ...], text, mode?: "steer",
+//                            client_msg_id?, author? } -> 202 { messages: [{ message_id, node_id }],
+//                            broadcast_id?, skipped: [{ node_id, reason }] }. Targets that are no
+//                            longer running are skipped; 409 only if none of them can take it.
 //   POST /runs/:id/pauses/:pause_id  answer a pause: { decision: "approve" | "reject" | "submit",
 //                            values?: { field: text }, note?, author? } -> 200; 409 if already answered
 //   GET  /runs/:id/final     the finished trace (FINAL_OUTPUT shape); 409 while still running
@@ -26,6 +29,9 @@
 // mcp_execute_tool call to ask for approval, and the 2nd, 4th, ... ask which source to query.
 // The recorded run is sequential, so a pause holds the whole run: later events are shifted by
 // however long it waited. Rejecting skips that tool call; submitted input is merged into its args.
+//
+// A message to several agents is a broadcast: each target gets its own message (own message_id
+// and delivery state) carrying the same broadcast_id and broadcast_size.
 //
 // Usage: node mock-server.js   (PORT env var, default 8787), then open http://localhost:8787/
 const http = require("http");
@@ -49,7 +55,8 @@ function loadFinalOutput(file = path.join(ROOT, "trace-data.js")) {
 
 // ---------- runs ----------
 
-function createRun(source, id, { speed = 20, jitter = false, pauses = false } = {}) {
+function createRun(source, id, { speed = 20, jitter = false, pauses = false, parallel = false } = {}) {
+  if (parallel) source = runBranchesInParallel(source);
   const t0 = Date.parse(source.created_at);
   const start = Date.now() + 300;
   const shifted = retimeTrace(source, (t) => start + (t - t0) / speed, 1 / speed);
@@ -64,6 +71,7 @@ function createRun(source, id, { speed = 20, jitter = false, pauses = false } = 
     clients: new Set(),
     queued: new Map(),       // node_id -> message_ids not yet delivered
     msgCount: 0,
+    broadcastCount: 0,
     pause: null,             // the pause holding the run, if any
     pauses: new Map(),       // pause_id -> pause
     done: false,
@@ -71,6 +79,40 @@ function createRun(source, id, { speed = 20, jitter = false, pauses = false } = 
   if (pauses) markPauses(schedule);
   pump(run);
   return run;
+}
+
+// parallel=1: the recorded workflow runs its expert branches (consecutive condition steps under
+// the root) one after another. This starts them together, as an Agno Parallel step would, and
+// moves the steps after them up to when the slowest has finished. Only timestamps change.
+function runBranchesInParallel(o) {
+  const byId = new Map(o.nodes.map((n) => [n.node_id, n]));
+  const root = byId.get(o.root_ids[0]);
+  const kids = (root.children_ids || []).map((id) => byId.get(id));
+  const i = kids.findIndex((k, j) => k.type === "condition" && kids[j + 1] && kids[j + 1].type === "condition");
+  if (i < 0) return o;
+  let j = i;
+  while (kids[j + 1] && kids[j + 1].type === "condition") j++;
+
+  const t = (iso) => Date.parse(iso);
+  const shift = new Map(); // node_id -> ms to move it by
+  const move = (n, d) => { shift.set(n.node_id, d); (n.children_ids || []).forEach((c) => move(byId.get(c), d)); };
+  const start = t(kids[i].started_at);
+  let end = -Infinity;
+  for (let k = i; k <= j; k++) {
+    const d = start - t(kids[k].started_at);
+    move(kids[k], d);
+    end = Math.max(end, t(kids[k].completed_at) + d);
+  }
+  const later = end - t(kids[j].completed_at); // the last branch used to end the group
+  kids.slice(j + 1).forEach((k) => move(k, later));
+
+  const at = (iso, d) => new Date(t(iso) + d).toISOString();
+  const nodes = o.nodes.map((n) => {
+    const d = shift.get(n.node_id);
+    if (d) return retimeTrace(n, (x) => x + d);
+    return n === root ? { ...n, completed_at: at(n.completed_at, later) } : n;
+  });
+  return { ...o, nodes, completed_at: at(o.completed_at, later), total_duration_seconds: o.total_duration_seconds + later / 1000 };
 }
 
 // Picks each tool-calling agent's first mcp_execute_tool call (or first call) as a pause point.
@@ -205,21 +247,28 @@ function postMessages(run, body) {
   if (!Array.isArray(targets) || !targets.length || targets.length > LIMITS.targets || !targets.every((t) => typeof t === "string")) {
     return fail(400, `targets must be 1–${LIMITS.targets} node ids.`);
   }
+  const ids = [...new Set(targets)];
   if (mode !== "steer") return fail(400, `mode "${mode}" is not supported.`);
   if (client_msg_id != null && (typeof client_msg_id !== "string" || client_msg_id.length > LIMITS.id)) return fail(400, "client_msg_id is invalid.");
   if (author != null && (typeof author !== "string" || author.length > LIMITS.author)) return fail(400, "author is invalid.");
 
-  for (const t of targets) {
+  // Unknown ids and non-agents are mistakes in the request; an agent that finished meanwhile is
+  // a race with the run, so it is skipped rather than failing the whole broadcast.
+  const live = [], skipped = [];
+  for (const t of ids) {
     const n = run.store.node(t);
     if (!n) return fail(404, "No such node in this run.", { node_id: t });
     if (!STEERABLE.has(n.type)) return fail(422, `A ${n.type} can't take messages; send to an agent.`, { node_id: t });
-    if (n.status !== "running" && n.status !== "paused") return fail(409, `${n.name} is not running.`, { node_id: t });
+    if (n.status === "running" || n.status === "paused") live.push(t);
+    else skipped.push({ node_id: t, reason: `${n.name} is not running.` });
   }
+  if (!live.length) return fail(409, skipped.length === 1 ? skipped[0].reason : "None of these agents are running.", { skipped });
 
   const sentAt = new Date().toISOString();
-  const messages = targets.map((node_id) => {
+  const broadcast = ids.length > 1 ? { broadcast_id: `b_${++run.broadcastCount}`, broadcast_size: live.length } : null;
+  const messages = live.map((node_id) => {
     const message_id = `m_${++run.msgCount}`;
-    const evt = { node_id, type: "human", event: "human.message", message_id, text, mode, started_at: sentAt };
+    const evt = { node_id, type: "human", event: "human.message", message_id, text, mode, started_at: sentAt, ...broadcast };
     if (client_msg_id) evt.client_msg_id = client_msg_id;
     if (author) evt.author = author;
     emit(run, evt);
@@ -227,7 +276,7 @@ function postMessages(run, body) {
     run.queued.get(node_id).push(message_id);
     return { message_id, node_id };
   });
-  return [202, { messages }];
+  return [202, { messages, skipped, ...(broadcast && { broadcast_id: broadcast.broadcast_id }) }];
 }
 
 // ---------- http ----------
@@ -313,7 +362,7 @@ function createServer({ source = loadFinalOutput(), log = () => {} } = {}) {
       const q = url.searchParams;
       let run = runs.get(id);
       if (!run) {
-        run = createRun(source, id, { speed: Math.max(0.01, +q.get("speed") || 20), jitter: q.get("jitter") === "1", pauses: q.get("pauses") === "1" });
+        run = createRun(source, id, { speed: Math.max(0.01, +q.get("speed") || 20), jitter: q.get("jitter") === "1", pauses: q.get("pauses") === "1", parallel: q.get("parallel") === "1" });
         runs.set(id, run);
         log(`run ${id}: ${run.schedule.length} events over ${((run.schedule.at(-1).ts - Date.now()) / 1000).toFixed(1)}s`);
       }
@@ -334,7 +383,7 @@ function createServer({ source = loadFinalOutput(), log = () => {} } = {}) {
       if (!run) { json(res, 404, { error: "Unknown run." }); return; }
       readJson(req, res, (body) => {
         const [status, out] = postMessages(run, body);
-        if (status === 202) log(`run ${id}: message to ${out.messages.map((x) => x.node_id.slice(0, 8)).join(", ")}`);
+        if (status === 202) log(`run ${id}: message to ${out.messages.map((x) => x.node_id.slice(0, 8)).join(", ")}${out.skipped.length ? ` (skipped ${out.skipped.length})` : ""}`);
         json(res, status, out);
       });
       return;
@@ -361,4 +410,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { createServer, loadFinalOutput };
+module.exports = { createServer, loadFinalOutput, runBranchesInParallel };

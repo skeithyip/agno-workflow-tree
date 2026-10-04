@@ -105,9 +105,12 @@
   //
   // Steering messages are ordinary messages of type "human" on the agent they were sent to, so
   // they end up in that node's `messages` in FINAL_OUTPUT:
-  //   { seq, node_id, type: "human", event: "human.message", message_id, client_msg_id?, author?, text, mode: "steer", started_at }
+  //   { seq, node_id, type: "human", event: "human.message", message_id, client_msg_id?, author?, text, mode: "steer",
+  //     broadcast_id?, broadcast_size?, started_at }
   //   { seq, node_id, type: "human", event: "human.delivered" | "human.expired", message_id, completed_at }
   // "delivered" means the agent read it (at its next turn); "expired" means it finished first.
+  // A message sent to several agents at once is a broadcast: each agent gets its own message
+  // (own message_id and delivery) with the same broadcast_id and broadcast_size.
   // They are sent with POST <events url minus /events>/messages (see mock-server.js).
   //
   // An agent can pause before a tool call to ask for approval ("confirm") or input ("input"):

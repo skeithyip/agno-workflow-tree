@@ -347,3 +347,81 @@ test("pauses: run waits for an answer; approve, submit input and reject each tak
     server.close();
   }
 });
+
+// ---------- broadcast ----------
+
+const { runBranchesInParallel } = require("../mock-server.js");
+
+test("parallel=1 starts the expert branches together and still folds exactly", () => {
+  const par = runBranchesInParallel(FINAL);
+  const n = (name) => par.nodes.find((x) => x.name === name);
+  const t = (iso) => Date.parse(iso);
+  // (Shifted timestamps keep millisecond precision, so compare times, not strings.)
+  assert.equal(t(n("route-sentiment").started_at), t(n("route-trends").started_at));
+  assert.ok(t(n("Expert: Sentiment").started_at) < t(n("Expert: Trends").completed_at), "the two experts overlap");
+  const branchesEnd = Math.max(t(n("route-trends").completed_at), t(n("route-sentiment").completed_at));
+  const gap = t(FINAL.nodes.find((x) => x.name === "aggregate_findings").started_at) - t(FINAL.nodes.find((x) => x.name === "route-sentiment").completed_at);
+  assert.ok(Math.abs(t(n("aggregate_findings").started_at) - branchesEnd - gap) <= 1, "later steps keep their gap after the branches");
+  assert.ok(t(par.completed_at) < t(FINAL.completed_at));
+  // Message order inside each node is unchanged, and nothing else moved.
+  assert.deepEqual(par.nodes.map((x) => (x.messages || []).map((m) => m.type)), FINAL.nodes.map((x) => (x.messages || []).map((m) => m.type)));
+  assert.equal(n("Collector: Source Discovery").started_at, FINAL.nodes.find((x) => x.name === "Collector: Source Discovery").started_at);
+  // Nodes now start interleaved, so they arrive in a different order; compare ignoring order.
+  assert.deepEqual(normalized(fold(traceToStream(par).map((it) => it.evt)).snapshot()), normalized(par));
+});
+
+test("broadcast: one message per running agent with a shared broadcast_id; finished ones are skipped", async () => {
+  const server = createServer({ source: FINAL });
+  await new Promise((r) => server.listen(0, r));
+  const base = `http://localhost:${server.address().port}`;
+  const byName = (name) => FINAL.nodes.find((n) => n.name === name).node_id;
+  const [collector, trends, sentiment] = ["Collector: Source Discovery", "Expert: Trends", "Expert: Sentiment"].map(byName);
+  const started = new Set();
+  const events = [];
+  const res = {};
+  try {
+    await follow(`${base}/runs/bc/events?speed=200&parallel=1`, async (evt) => {
+      events.push(evt);
+      if (evt.event === "agent.started") started.add(evt.node.node_id);
+      if (evt.event === "agent.started" && started.has(trends) && started.has(sentiment) && !res.both) {
+        res.both = await post(base, "bc", { targets: [trends, sentiment, trends], text: "Compare notes", client_msg_id: "c_b", author: "Tester" });
+        res.partial = await post(base, "bc", { targets: [collector, trends], text: "Collector is done" });
+        res.none = await post(base, "bc", { targets: [collector, byName("Orchestrator")], text: "Too late" });
+        res.single = await post(base, "bc", { targets: [collector], text: "Too late" });
+        res.badType = await post(base, "bc", { targets: [trends, byName("expert-trends")], text: "x" });
+      }
+    });
+
+    assert.equal(res.both.status, 202);
+    assert.equal(res.both.body.messages.length, 2, "duplicate target sent once");
+    assert.match(res.both.body.broadcast_id, /^b_/);
+    assert.deepEqual(res.both.body.skipped, []);
+    const sent = events.filter((e) => e.event === "human.message" && e.broadcast_id === res.both.body.broadcast_id);
+    assert.deepEqual(sent.map((e) => e.node_id).sort(), [trends, sentiment].sort());
+    assert.ok(sent.every((e) => e.broadcast_size === 2 && e.client_msg_id === "c_b" && e.text === "Compare notes"));
+    assert.notEqual(sent[0].message_id, sent[1].message_id);
+    // Each copy is delivered on its own agent's schedule.
+    for (const m of sent) {
+      const d = events.find((e) => e.type === "human" && e.message_id === m.message_id && e.event !== "human.message");
+      assert.equal(d.event, "human.delivered");
+      assert.equal(d.node_id, m.node_id);
+    }
+
+    assert.equal(res.partial.status, 202);
+    assert.deepEqual(res.partial.body.messages.map((m) => m.node_id), [trends]);
+    assert.deepEqual(res.partial.body.skipped, [{ node_id: collector, reason: "Collector: Source Discovery is not running." }]);
+    assert.ok(events.find((e) => e.message_id === res.partial.body.messages[0].message_id).broadcast_size === 1);
+
+    assert.equal(res.none.status, 409);
+    assert.equal(res.none.body.skipped.length, 2);
+    assert.equal(res.single.status, 409);
+    assert.equal(res.single.body.error, "Collector: Source Discovery is not running.");
+    assert.equal(res.single.body.broadcast_id, undefined);
+    assert.equal(res.badType.status, 422, "a step in the list is a request error, not a skip");
+
+    const final = await (await fetch(`${base}/runs/bc/final`)).json();
+    assert.deepEqual(fold(events).snapshot(), final);
+  } finally {
+    server.close();
+  }
+});

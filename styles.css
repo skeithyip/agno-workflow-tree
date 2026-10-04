@@ -375,3 +375,29 @@ code { font-size: 12px; }
   .node .meta { display: none; }
   .pause-card { max-height: none; }
 }
+
+/* Broadcast: recipients */
+.composer-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; font-size: 12px; }
+.composer-head .composer-label { margin-right: 2px; }
+.chips { display: contents; }
+.chip {
+  display: inline-flex; align-items: center; gap: 4px; max-width: 100%;
+  padding: 1px 4px 1px 8px; border-radius: 999px; border: 1px solid var(--line); background: var(--surface);
+}
+.chip .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 16em; }
+.chip:not(:has(.chip-x)) { padding-right: 8px; }
+.chip-x { border: none; background: none; padding: 0 4px; line-height: 1; font-size: 14px; color: var(--muted); }
+.chip-x:hover { color: var(--text); }
+.linkish { border: none; background: none; padding: 0 2px; color: var(--accent); font-size: 12px; }
+.linkish:hover { text-decoration: underline; }
+.linkish[hidden] { display: none; }
+.picker { border: 1px solid var(--line); border-radius: 6px; padding: 8px; background: var(--bg); }
+.picker[hidden] { display: none; }
+.picker-actions { display: flex; gap: 6px; margin-bottom: 6px; }
+.picker-actions button { font-size: 12px; padding: 2px 8px; }
+.picker-list { list-style: none; margin: 0; padding: 0; max-height: 180px; overflow-y: auto; }
+.picker-list label { display: flex; align-items: center; gap: 6px; padding: 3px 2px; font-size: 13px; cursor: pointer; }
+.picker-list .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.picker-list input { padding: 0; }
+.picker-tip { font-size: 11px; margin: 6px 0 0; }
+.node.recipient, .span.recipient { box-shadow: inset 3px 0 0 var(--accent); }
