@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agno Workflow Tree</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="bar">
+    <h1>Agno Workflow Tree</h1>
+    <div class="controls">
+      <div class="seg" role="group" aria-label="View">
+        <button data-view="tree" aria-pressed="true">Tree</button>
+        <button data-view="trace" aria-pressed="false">Trace</button>
+      </div>
+      <label>Dataset
+        <select id="dataset">
+          <option value="trace">Research workflow (trace)</option>
+          <option value="large">Synthetic (stress test)</option>
+        </select>
+      </label>
+      <input id="search" type="search" placeholder="Find step or agent…" aria-label="Search">
+      <button id="expandAll">Expand all</button>
+      <button id="collapseAll">Collapse all</button>
+      <button id="run" class="primary">Replay events</button>
+    </div>
+  </header>
+
+  <nav id="crumbs" class="crumbs" aria-label="Focus path"></nav>
+
+  <main id="treeView" class="layout">
+    <section class="tree-wrap" aria-label="Workflow">
+      <ul id="tree" class="tree" role="tree"></ul>
+    </section>
+    <aside id="panel" class="panel" aria-live="polite">
+      <p class="muted">Select a node to see its details.</p>
+    </aside>
+  </main>
+
+  <main id="traceView" class="layout" hidden>
+    <section class="trace-wrap" aria-label="Spans">
+      <div class="trace-tools">
+        <label><input id="errorsOnly" type="checkbox"> Errors only</label>
+        <span id="traceSummary"></span>
+        <span class="keys">↑↓ move · ←→ collapse/expand</span>
+      </div>
+      <div id="spanScroll" class="span-scroll" tabindex="0" role="tree" aria-label="Spans">
+        <div class="span-head" aria-hidden="true"><div>Span</div><div class="span-dur">Duration</div><div id="axis" class="axis"></div></div>
+        <div id="spanCanvas" class="span-canvas"></div>
+      </div>
+    </section>
+    <aside id="spanPanel" class="panel" aria-live="polite"></aside>
+  </main>
+
+  <footer id="stats" class="stats"></footer>
+
+  <script src="data.js"></script>
+  <script src="trace-data.js"></script>
+  <script src="trace.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
