@@ -8,6 +8,8 @@
 // Data: a trace is loaded by buildWorkflowFromTrace() (trace.js) into a nested root whose nodes
 // carry status, timestamps, model, metrics and `events` (the raw message records). On load the
 // view is seeded from that; "Replay events" re-emits those events over time through ingest().
+// A live run arrives over SSE instead (see "live stream" below): nodes are added as they start
+// and their events go through the same ingest() path.
 (function () {
   const $ = (sel) => document.querySelector(sel);
   const treeEl = $("#tree");
@@ -30,6 +32,7 @@
   let running = false;
   let seeding = false;
   let lastRenderMs = null;
+  let nextId = 0;         // next internal id (nodes keep theirs when a live run adds more)
 
   const dirty = new Set();
   let flushTimer = null;
@@ -54,9 +57,9 @@
     byTraceId = new Map();
     focusId = null;
     selectedId = null;
-    let n = 0;
+    nextId = 0;
     (function walk(node, parent) {
-      node.id = "n" + n++;
+      node.id = "n" + nextId++;
       index.set(node.id, { node, parent });
       if (node.traceId) byTraceId.set(node.traceId, node.id);
       (node.children || []).forEach((c) => walk(c, node));
@@ -65,10 +68,12 @@
     resetRun();
     seedFromTrace();
     renderHeader();
-    render({ openDepth: index.size > 200 ? 1 : 4 });
+    render({ openDepth: defaultOpenDepth() });
     showPanel(null);
     resetTrace();
   }
+
+  const defaultOpenDepth = () => (index.size > 200 ? 1 : 4);
 
   function resetRun() {
     records = new Map();
@@ -179,7 +184,7 @@
     } else if (typeof evt.event === "string") {
       const suf = evt.event.split(".").pop();
       if (suf === "started") { if (rec.status === "pending") rec.status = "running"; rec.start = rec.start || ms(evt.started_at); }
-      else if (suf === "error" || suf === "failed") { rec.status = "failed"; rec.end = ms(evt.completed_at) || Date.now(); if (evt.error) addEntry(id, { kind: "error", text: evt.error, ts: Date.now() }); }
+      else if (suf === "error" || suf === "failed" || mapStatus(evt.status) === "failed") { rec.status = "failed"; rec.end = ms(evt.completed_at) || Date.now(); if (evt.error) addEntry(id, { kind: "error", text: evt.error, ts: Date.now() }); }
       else if (suf === "completed") { if (rec.status !== "failed") rec.status = "done"; rec.end = ms(evt.completed_at) || Date.now(); rec.open = {}; }
     }
 
@@ -191,6 +196,8 @@
   function flush() {
     flushTimer = null;
     flushCount++;
+    structural.forEach(syncChildrenDom);
+    structural.clear();
     dirty.forEach(updateRow);
     if (view === "trace") refreshTrace(dirty);
     else if (selectedId && [...dirty].some((id) => id === selectedId || (includeChildren && isUnder(id, selectedId)))) {
@@ -564,7 +571,7 @@
     rows = [];
     fullShown = new Set();
     traceOpen = new Set();
-    const depthLimit = index.size > 200 ? 1 : 4;
+    const depthLimit = defaultOpenDepth();
     (function walk(node, d) {
       if (d < depthLimit) traceOpen.add(node.id);
       (node.children || []).forEach((k) => walk(k, d + 1));
@@ -611,6 +618,7 @@
     }
 
     spanRoot = nodeSpan(focusId ? index.get(focusId).node : root, 0, null);
+    if (live && !live.done && isFinite(tMin)) tMax = Math.max(tMax, Date.now() + live.skew); // running bars reach "now"
     const t0 = spanRoot.start ?? tMin;
     const t1 = Math.max(tMax, spanRoot.end ?? -Infinity);
     win = isFinite(t0) && isFinite(t1) && t1 > t0 ? { t0, t1 } : { t0: isFinite(t0) ? t0 : 0, t1: (isFinite(t0) ? t0 : 0) + 1 };
@@ -1006,6 +1014,193 @@
       ` · ${eventCount} events` + (flushCount ? ` · ${flushCount} screen updates` : "");
   }
 
+  // ---------- live stream ----------
+  // Connects to an SSE endpoint (event contract in trace.js) and folds events with
+  // createTraceStore. Nodes are attached in place as they start (addLiveNode); everything else
+  // goes through ingest() and is drawn by flush() as usual. When the run completes, the final
+  // trace replaces the streamed one, keeping selection, focus and open groups (reload).
+
+  const LIVE_TICK_MS = 1000;      // how often running bars grow in the trace view between events
+  const LIVE_PASS = ["speed", "jitter", "drop"]; // page query params forwarded to the mock server
+  const LIVE_LABEL = { connecting: "Connecting…", live: "Live", reconnecting: "Reconnecting…", completed: "Run complete", error: "Disconnected" };
+  const LIVE_DOT = { connecting: "pending", live: "running", reconnecting: "pending", completed: "done", error: "failed" };
+  const structural = new Set();   // nodes that gained children since the last flush
+  let live = null;                // { url, es, store, skew, done, tick }
+
+  const placeholderRoot = (name) => ({ type: "workflow", name, status: "pending", placeholder: true, children: [], events: [] });
+
+  function liveUrl() {
+    const q = new URLSearchParams(location.search);
+    if (q.get("stream")) return q.get("stream");
+    const pass = new URLSearchParams();
+    LIVE_PASS.forEach((k) => { if (q.has(k)) pass.set(k, q.get(k)); });
+    return `/runs/demo-${Date.now().toString(36)}/events` + (pass.size ? "?" + pass : "");
+  }
+
+  function startLive() {
+    stopLive();
+    if (location.protocol === "file:" && !new URLSearchParams(location.search).get("stream")) {
+      load(placeholderRoot("Live stream needs the mock server: run `npm start`, then open http://localhost:8787/"));
+      setLiveStatus("error", "No server");
+      return;
+    }
+    const L = (live = { url: liveUrl(), skew: 0, done: false });
+    L.store = window.createTraceStore({
+      onRun: (evt) => { if (evt.event === "run.completed") finishLive(L, evt); },
+      onNodeAdd: (n, evt) => {
+        if (n.parent_id && byTraceId.has(n.parent_id)) addLiveNode(n);
+        else reload(window.buildWorkflowFromTrace(L.store.snapshot())); // a root: (re)build around it
+        ingest({ node_id: n.node_id, event: evt.event, started_at: n.started_at });
+      },
+      onNodeUpdate: (n, evt) => {
+        const id = byTraceId.get(n.node_id);
+        if (id) Object.assign(index.get(id).node, { status: n.status, completed_at: n.completed_at, metrics: n.metrics || null });
+        ingest({ node_id: n.node_id, event: evt.event, status: n.status, completed_at: n.completed_at });
+      },
+      onMessage: (n, evt) => {
+        const id = byTraceId.get(n.node_id);
+        if (id) index.get(id).node.events = n.messages; // so a later replay has everything
+        ingest(evt);
+      },
+    });
+    load(placeholderRoot("Waiting for the run to start…"));
+    setLiveStatus("connecting");
+
+    const es = (L.es = new EventSource(L.url));
+    es.addEventListener("trace", (e) => {
+      if (live !== L) return;
+      try { L.store.apply(JSON.parse(e.data)); } catch (err) { console.error("Bad stream event", err, e.data); }
+    });
+    es.addEventListener("heartbeat", (e) => {
+      const t = JSON.parse(e.data).server_time_ms;
+      if (t) L.skew = t - Date.now();
+    });
+    es.onopen = () => { if (live === L && !L.done) setLiveStatus("live"); };
+    es.onerror = () => {
+      if (live !== L || L.done) return;
+      setLiveStatus(es.readyState === EventSource.CLOSED ? "error" : "reconnecting");
+    };
+    L.tick = setInterval(() => { if (view === "trace" && !L.done && spanRoot) refreshTrace(new Set()); }, LIVE_TICK_MS);
+    updateRunButton();
+  }
+
+  function stopLive() {
+    if (!live) return;
+    live.es?.close();
+    clearInterval(live.tick);
+    live = null;
+    setLiveStatus(null);
+    updateRunButton();
+  }
+
+  function finishLive(L, evt) {
+    L.done = true;
+    L.es.close();
+    clearInterval(L.tick);
+    setLiveStatus("completed");
+    const apply = (wf) => { if (live === L) { reload(wf); updateRunButton(); } };
+    const streamed = () => window.buildWorkflowFromTrace(L.store.snapshot());
+    if (!evt.final_url) { apply(streamed()); return; }
+    fetch(new URL(evt.final_url, new URL(L.url, location.href)))
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status))))
+      .then((final) => apply(window.buildWorkflowFromTrace(final)))
+      .catch((err) => { console.warn("Final trace unavailable; keeping the streamed one.", err); apply(streamed()); });
+  }
+
+  function setLiveStatus(state, text) {
+    const el = $("#liveStatus");
+    el.hidden = !state;
+    if (!state) return;
+    el.className = `pill live-status st-${LIVE_DOT[state]}`;
+    el.querySelector(".txt").textContent = text || LIVE_LABEL[state];
+    el.title = live ? `Stream: ${live.url}` : "";
+  }
+
+  function updateRunButton() {
+    $("#run").disabled = running || !!(live && !live.done);
+  }
+
+  function addLiveNode(n) {
+    const parentId = byTraceId.get(n.parent_id);
+    const parent = index.get(parentId).node;
+    const node = window.viewNode(n);
+    node.id = "n" + nextId++;
+    parent.children.push(node);
+    index.set(node.id, { node, parent });
+    byTraceId.set(n.node_id, node.id);
+    records.set(node.id, newRecord());
+    if (pathTo(node.id).length - 1 < defaultOpenDepth()) traceOpen.add(node.id);
+    structural.add(parentId);
+  }
+
+  // A node gained children: refresh the counts above it and, if its row is on screen, add the
+  // new rows (a former leaf is rebuilt as a group). Groups not yet opened build on first open.
+  function syncChildrenDom(id) {
+    const entry = index.get(id);
+    if (!entry) return;
+    pathTo(id).forEach((a) => {
+      const c = treeEl.querySelector(`.node[data-id="${a.id}"] > .count`);
+      if (c) c.textContent = countDescendants(a);
+    });
+    const row = treeEl.querySelector(`.node[data-id="${id}"]`);
+    if (!row) return;
+    const depth = pathTo(id).length - 1;
+    const opts = { openDepth: defaultOpenDepth() };
+    const details = row.parentElement.tagName === "SUMMARY" ? row.parentElement.parentElement : null;
+    if (!details) { row.closest("li").replaceWith(buildNode(entry.node, depth, opts)); return; }
+    if (!details.dataset.built) return;
+    const ul = details.querySelector(":scope > ul");
+    entry.node.children.slice(ul.children.length).forEach((k) => ul.append(buildNode(k, depth + 1, opts)));
+  }
+
+  // Load a new version of the same run without losing the user's place: selection, focus, open
+  // groups and search hits are carried over by trace node id (internal ids are reassigned).
+  function reload(workflow) {
+    if (!root || root.placeholder) { load(workflow); return; }
+    const toTrace = (id) => (id && index.get(id)?.node.traceId) || null;
+    const back = (t) => (t && byTraceId.get(t)) || null;
+    // Span ids are a node id, "t:<tool call id>", or "<node id>:<kind><n>" (see buildSpans).
+    const spanTo = (sid) => {
+      if (!sid || sid.startsWith("t:")) return sid;
+      const i = sid.indexOf(":");
+      const t = toTrace(i < 0 ? sid : sid.slice(0, i));
+      return t && (i < 0 ? t : t + sid.slice(i));
+    };
+    const spanBack = (sid) => {
+      if (!sid || sid.startsWith("t:")) return sid;
+      const i = sid.indexOf(":");
+      const id = back(i < 0 ? sid : sid.slice(0, i));
+      return id && (i < 0 ? id : id + sid.slice(i));
+    };
+    const treeWrap = treeEl.parentElement;
+    const saved = {
+      treeOpen: [...treeEl.querySelectorAll("details[open] > summary > .node")].map((el) => toTrace(el.dataset.id)),
+      sel: toTrace(selectedId),
+      focus: toTrace(focusId),
+      traceOpen: [...traceOpen].map(toTrace),
+      traceSel: spanTo(traceSel),
+      hits: traceHits && [...traceHits].map(spanTo),
+      treeScroll: treeWrap.scrollTop,
+      spanScroll: spanScroll.scrollTop,
+    };
+
+    load(workflow);
+    focusId = back(saved.focus);
+    selectedId = back(saved.sel);
+    traceOpen = new Set(saved.traceOpen.map(back).filter(Boolean));
+    traceSel = spanBack(saved.traceSel);
+    traceHits = saved.hits && new Set(saved.hits.map(spanBack).filter(Boolean));
+    render({ openIds: new Set(saved.treeOpen.map(back).filter(Boolean)) });
+    treeWrap.scrollTop = saved.treeScroll;
+    if (view === "trace") {
+      renderTrace();
+      spanScroll.scrollTop = saved.spanScroll;
+      renderWindow();
+    } else {
+      showPanel(selectedId);
+    }
+  }
+
   // ---------- helpers ----------
 
   function fmtDur(ms) {
@@ -1046,6 +1241,8 @@
   $("#dataset").addEventListener("change", (e) => {
     if (running) return;
     $("#search").value = "";
+    if (e.target.value === "live") { startLive(); return; }
+    stopLive();
     load(e.target.value === "large" ? window.makeLargeWorkflow() : window.buildWorkflowFromTrace(window.FINAL_OUTPUT));
   });
 
@@ -1074,5 +1271,12 @@
     treeEl.querySelector(".node.hit")?.scrollIntoView({ block: "center" });
   }
 
-  load(window.buildWorkflowFromTrace(window.FINAL_OUTPUT));
+  // ?dataset=live or ?stream=<url> opens straight into a live run.
+  const startParams = new URLSearchParams(location.search);
+  if (startParams.has("stream") || startParams.get("dataset") === "live") {
+    $("#dataset").value = "live";
+    startLive();
+  } else {
+    load(window.buildWorkflowFromTrace(window.FINAL_OUTPUT));
+  }
 })();

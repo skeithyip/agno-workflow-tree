@@ -303,3 +303,6 @@ code { font-size: 12px; }
   .trace-tools .keys { display: none; }
   .axis span:not(:first-child):not(:last-child), .span-head .span-dur { visibility: hidden; }
 }
+
+/* Live stream status */
+.live-status { white-space: nowrap; font-size: 12px; }

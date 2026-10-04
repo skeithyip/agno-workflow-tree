@@ -18,8 +18,10 @@
         <select id="dataset">
           <option value="trace">Research workflow (trace)</option>
           <option value="large">Synthetic (stress test)</option>
+          <option value="live">Live stream (SSE)</option>
         </select>
       </label>
+      <span id="liveStatus" class="pill live-status" role="status" hidden><span class="dot"></span><span class="txt"></span></span>
       <input id="search" type="search" placeholder="Find step or agent…" aria-label="Search">
       <button id="expandAll">Expand all</button>
       <button id="collapseAll">Collapse all</button>

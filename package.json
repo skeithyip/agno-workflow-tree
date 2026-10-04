@@ -1,0 +1,9 @@
+{
+  "name": "agno-workflow-tree",
+  "private": true,
+  "description": "Tree and trace viewer for Agno workflow runs, with a mock SSE backend.",
+  "scripts": {
+    "start": "node mock-server.js",
+    "test": "node --test test/*.test.js"
+  }
+}
