@@ -30,6 +30,13 @@
     expired: { dot: "pending", label: "not delivered", title: "The agent finished before reading it" },
     failed: { dot: "failed", label: "not sent" },
   };
+  // Pause (approval / input request) states.
+  const PAUSE_STATE = {
+    open: { dot: "waiting", label: "waiting for decision" },
+    approved: { dot: "done", label: "approved" },
+    submitted: { dot: "done", label: "answered" },
+    rejected: { dot: "pending", label: "rejected" },
+  };
 
   let root;               // the nested workflow
   let index = new Map();  // internal id -> { node, parent }
@@ -38,6 +45,7 @@
   let entries = [];       // all timeline entries, in arrival order
   let humanById = new Map();     // message_id -> steering entry (for delivery updates)
   let humanByClient = new Map(); // "client_msg_id|node id" -> entry sent from here, until the server echoes it
+  let openPauses = new Map();    // pause_id -> unanswered pause entry, in request order
   let focusId = null;     // when set, only this subtree is shown
   let selectedId = null;
   let includeChildren = false;
@@ -51,13 +59,14 @@
   let eventCount = 0;
   let flushCount = 0;
 
-  const newRecord = () => ({ status: "pending", start: null, end: null, tools: 0, toolErrors: 0, reasoning: 0, human: 0, entries: [], open: {} });
+  const newRecord = () => ({ status: "pending", start: null, end: null, tools: 0, toolErrors: 0, reasoning: 0, human: 0, pauses: 0, openPauses: 0, entries: [], open: {} });
   const ms = (iso) => (iso ? Date.parse(iso) : null);
 
   function mapStatus(s) {
     if (s === "completed" || s === "success" || s === "done") return "done";
     if (s === "failed" || s === "error" || s === "cancelled") return "failed";
     if (s === "running" || s === "in_progress") return "running";
+    if (s === "paused" || s === "waiting") return "waiting";
     return "pending";
   }
 
@@ -83,6 +92,7 @@
     render({ openDepth: defaultOpenDepth() });
     showPanel(null);
     resetTrace();
+    updateWaiting();
   }
 
   const defaultOpenDepth = () => (index.size > 200 ? 1 : 4);
@@ -93,6 +103,7 @@
     entries = [];
     humanById = new Map();
     humanByClient = new Map();
+    openPauses = new Map();
     eventCount = 0;
     flushCount = 0;
   }
@@ -208,12 +219,34 @@
         const outcome = evt.event.split(".").pop();
         if (e && (outcome === "delivered" || outcome === "expired")) { e.status = outcome; e.end = ms(evt.completed_at); e.ver++; }
       }
+    } else if (t === "pause") {
+      // The agent stopped before a tool call to ask for approval or input (answered in the
+      // pause card; see "approvals" below).
+      if (evt.event === "pause.requested") {
+        const e = addEntry(id, {
+          kind: "pause", pauseId: evt.pause_id, pauseKind: evt.kind, prompt: evt.prompt || "", toolName: evt.tool_name,
+          toolArgs: evt.tool_args, callId: evt.tool_call_id, fields: evt.fields || [], status: "open", start: ms(evt.started_at), ts: ms(evt.started_at),
+        });
+        rec.pauses++;
+        rec.openPauses++;
+        openPauses.set(evt.pause_id, e);
+      } else if (evt.event === "pause.resolved") {
+        const e = openPauses.get(evt.pause_id);
+        if (e) {
+          Object.assign(e, { status: evt.decision, values: evt.values, note: evt.note, by: evt.resolved_by, end: ms(evt.completed_at), sending: null, error: null });
+          e.ver++;
+          openPauses.delete(evt.pause_id);
+          rec.openPauses = Math.max(0, rec.openPauses - 1);
+        }
+      }
     } else if (t === "content") {
       const structured = evt.content_type && evt.content_type !== "str" ? evt.data : null;
       addEntry(id, { kind: "content", text: evt.text || "", data: structured, contentType: evt.content_type, ts: ms(evt.completed_at || evt.started_at) });
     } else if (typeof evt.event === "string") {
       const suf = evt.event.split(".").pop();
-      if (suf === "started") { if (rec.status === "pending") rec.status = "running"; rec.start = rec.start || ms(evt.started_at); }
+      if (suf === "paused") rec.status = "waiting";
+      else if (suf === "continued" || suf === "resumed") { if (rec.status === "waiting") rec.status = "running"; }
+      else if (suf === "started") { if (rec.status === "pending") rec.status = "running"; rec.start = rec.start || ms(evt.started_at); }
       else if (suf === "error" || suf === "failed" || mapStatus(evt.status) === "failed") { rec.status = "failed"; rec.end = ms(evt.completed_at) || Date.now(); if (evt.error) addEntry(id, { kind: "error", text: evt.error, ts: Date.now() }); }
       else if (suf === "completed") { if (rec.status !== "failed") rec.status = "done"; rec.end = ms(evt.completed_at) || Date.now(); rec.open = {}; }
     }
@@ -235,6 +268,7 @@
     }
     dirty.clear();
     updateStats();
+    updateWaiting();
   }
 
   // ---------- header ----------
@@ -327,6 +361,7 @@
     if (rec.tools) h += `<span class="b" title="tool calls">🔧${rec.tools}</span>`;
     if (rec.toolErrors) h += `<span class="b err" title="failed tool calls">⚠${rec.toolErrors}</span>`;
     if (rec.human) h += `<span class="b" title="steering messages">💬${rec.human}</span>`;
+    if (rec.openPauses) h += `<span class="b wait" title="waiting for approval or input">⏸ needs you</span>`;
     if (rec.start && rec.end) h += `<span class="b dur">${fmtDur(rec.end - rec.start)}</span>`;
     return h;
   }
@@ -340,6 +375,9 @@
     const b = el.querySelector(".badges");
     if (b.innerHTML !== html) b.innerHTML = html;
   }
+
+  // Internal ids of tree groups currently open on screen.
+  const openTreeIds = () => [...treeEl.querySelectorAll("details[open] > summary > .node")].map((el) => el.dataset.id);
 
   function renderCrumbs() {
     crumbsEl.replaceChildren();
@@ -418,7 +456,7 @@
     const tl = document.createElement("div");
     tl.className = "timeline";
 
-    panelEl.replaceChildren(h, sub, info, head, hidden, tl, treeComposer.el);
+    panelEl.replaceChildren(h, sub, info, head, hidden, tl, treePause.el, treeComposer.el);
     renderPanelLive();
     tl.scrollTop = 0; // start at the first event; live updates still stick to the bottom
   }
@@ -450,6 +488,7 @@
   function renderPanelLive() {
     const rec = records.get(selectedId);
     const node = index.get(selectedId).node;
+    treePause.update(selectedId);
     treeComposer.update(selectedId);
     panelEl.querySelector(".sub").innerHTML =
       `<span class="type t-${node.type}">${node.type}</span> <span class="pill st-${rec.status}"><span class="dot"></span>${rec.status}</span>` +
@@ -533,6 +572,16 @@
       el.querySelector(".h-err").textContent = e.error || "";
       el.querySelector(".txt").textContent = e.text;
       return;
+    } else if (e.kind === "pause") {
+      const st = PAUSE_STATE[e.status] || PAUSE_STATE.open;
+      el.classList.toggle("open", e.status === "open");
+      el.innerHTML = who(e) +
+        `<div class="h-head">⏸ <strong>${e.pauseKind === "input" ? "Input needed" : "Approval needed"}</strong> <code></code> ` +
+        `<span class="pill st-${st.dot}"><span class="dot"></span>${st.label}</span>` +
+        (e.start && e.end ? ` <span class="muted">after ${fmtDur(e.end - e.start)}</span>` : "") + `</div><p class="txt"></p>`;
+      el.querySelector("code").textContent = e.toolName || "tool";
+      el.querySelector(".txt").textContent = e.status === "open" ? e.prompt : pauseSummary(e);
+      return;
     } else if (e.kind === "error") {
       el.innerHTML = who(e) + `⚠ <span class="txt"></span>`;
       el.querySelector(".txt").textContent = e.text;
@@ -584,7 +633,7 @@
   const ROW_H = 28;          // must match .span height in styles.css
   const OVERSCAN = 8;        // extra rows drawn above and below the viewport
   const MAX_CHARS = 20000;   // longer values are cut until "Show all" is clicked
-  const LEAF_ICON = { tool: "🔧", reasoning: "💭", error: "⚠", human: "💬" };
+  const LEAF_ICON = { tool: "🔧", reasoning: "💭", error: "⚠", human: "💬", pause: "⏸" };
 
   const treeViewEl = $("#treeView");
   const traceViewEl = $("#traceView");
@@ -638,11 +687,12 @@
       spans.set(s.id, s);
       see(s.start); see(s.end);
       const kids = (node.children || []).map((k) => nodeSpan(k, depth + 1, s));
-      const n = { tool: 0, reasoning: 0, error: 0, human: 0 };
+      const n = { tool: 0, reasoning: 0, error: 0, human: 0, pause: 0 };
       rec.entries.forEach((e) => {
         if (!(e.kind in n)) return; // content is shown as the node's Output
         let id = e.kind === "tool" && e.callId ? "t:" + e.callId
           : e.kind === "human" ? (e.messageId ? "h:" + e.messageId : "hc:" + e.clientId)
+          : e.kind === "pause" ? "p:" + e.pauseId
           : `${node.id}:${e.kind}${n[e.kind]}`;
         n[e.kind]++;
         if (spans.has(id)) id += "#" + e.uid;
@@ -675,6 +725,7 @@
     switch (e.kind) {
       case "tool": return { name: e.name || "tool", status: e.status };
       case "reasoning": return { name: "Reasoning", status: e.done ? "done" : "running" };
+      case "pause": return { name: `${e.pauseKind === "input" ? "Input" : "Approval"}: ${e.toolName || "tool"}`, status: (PAUSE_STATE[e.status] || PAUSE_STATE.open).dot };
       case "human": return { name: `${authorLabel(e)}: ${e.text.split("\n")[0].slice(0, 120)}`, status: (HUMAN_STATE[e.status] || HUMAN_STATE.queued).dot };
       default: return { name: "Error", status: "failed" };
     }
@@ -771,7 +822,7 @@
   function barHtml(s) {
     if (s.start == null) return "";
     const span = win.t1 - win.t0;
-    const end = s.end ?? (s.status === "running" ? win.t1 : s.start);
+    const end = s.end ?? (s.status === "running" || s.status === "waiting" ? win.t1 : s.start);
     const left = Math.min(100, Math.max(0, ((s.start - win.t0) / span) * 100));
     const width = Math.min(100 - left, Math.max(0, ((end - s.start) / span) * 100));
     const cls = s.kind === "node" ? `k-node t-${s.node.type}` : `k-${s.kind}`;
@@ -843,6 +894,12 @@
   function inputOf(s) {
     if (s.kind === "tool") return s.entry.args != null ? [{ label: "Arguments", value: s.entry.args }] : [];
     if (s.kind === "human") return [{ label: `Message from ${authorLabel(s.entry)}`, value: s.entry.text }];
+    if (s.kind === "pause") {
+      const e = s.entry;
+      const out = [{ label: "Request", value: e.prompt }, { label: `Tool call · ${e.toolName || "tool"}`, value: e.toolArgs ?? "(no arguments)" }];
+      if (e.fields.length) out.push({ label: "Asks for", value: e.fields });
+      return out;
+    }
     return [];
   }
 
@@ -852,6 +909,12 @@
     if (s.kind === "reasoning") return e.steps.length ? [{ label: "Reasoning", value: e.steps.join("\n\n") }] : [];
     if (s.kind === "error") return [{ label: "Error", value: e.text }];
     if (s.kind === "human") return [];
+    if (s.kind === "pause") {
+      if (e.status === "open") return [];
+      const out = [{ label: "Decision", value: pauseSummary(e) }];
+      if (e.values) out.push({ label: "Values", value: e.values });
+      return out;
+    }
     const out = [];
     records.get(s.nodeId).entries.forEach((c) => {
       if (c.kind === "error") out.push({ label: "Error", value: c.text });
@@ -868,6 +931,7 @@
       if (s.kind === "node") return `This trace doesn't record inputs for ${s.node.type} spans.`;
       return `${s.kind === "reasoning" ? "Reasoning" : "An error"} has no separate input; see Output.`;
     }
+    if (s.kind === "pause") return live && !live.done ? "Waiting for a decision. Answer in the card below." : "No decision was recorded.";
     if (s.kind === "human") {
       const e = s.entry;
       const after = e.start && e.end ? ` ${fmtDur(e.end - e.start)} after it was sent` : "";
@@ -893,6 +957,7 @@
       add("tool calls", rec.tools + (rec.toolErrors ? ` (${rec.toolErrors} failed)` : ""));
       add("reasoning blocks", rec.reasoning);
       if (rec.human) add("steering messages", rec.human);
+      if (rec.pauses) add("pauses", rec.pauses + (rec.openPauses ? ` (${rec.openPauses} waiting)` : ""));
       add("child nodes", (s.node.children || []).length);
       return dl;
     }
@@ -906,6 +971,23 @@
     const iso = (t) => (t != null ? new Date(t).toISOString() : null);
     const e = s.entry;
     const human = s.kind === "human";
+    const pause = s.kind === "pause";
+    if (pause) {
+      add("kind", e.pauseKind === "input" ? "input request" : "approval request");
+      add("tool", e.toolName);
+      add("status", (PAUSE_STATE[e.status] || {}).label);
+      if (s.start != null && s.end != null) add("waited", fmtDur(s.end - s.start));
+      if (s.start != null) add("offset", "+" + (fmtDur(s.start - win.t0) || "0ms"));
+      add("requested", iso(s.start));
+      add("answered", iso(s.end));
+      add("answered by", e.by);
+      add("note", e.note);
+      add("pause id", e.pauseId);
+      add("tool call id", e.callId);
+      add("node", `${index.get(s.nodeId).node.name} (${index.get(s.nodeId).node.type})`);
+      add("path", pathTo(s.nodeId).map((x) => x.name).join(" › "));
+      return dl;
+    }
     add("kind", s.kind === "tool" ? "tool call" : human ? "steering message" : s.kind);
     if (s.kind === "tool") add("tool", s.name);
     if (human) { add("from", e.author || "unknown"); add("mode", e.mode); }
@@ -955,6 +1037,7 @@
 
   function renderDetail() {
     const s = traceSel && spans.get(traceSel);
+    tracePause.update(s ? s.nodeId : null);
     traceComposer.update(s ? s.nodeId : null);
     if (!s) {
       delete detailEl.dataset.sid;
@@ -972,7 +1055,9 @@
     const secs = { input: inputOf(s), output: outputOf(s) };
     const rec = records.get(s.nodeId);
     const dur = s.start != null && s.end != null ? fmtDur(s.end - s.start) : "";
-    const statusLabel = s.kind === "human" ? (HUMAN_STATE[s.entry.status] || {}).label : s.status === "failed" ? "error" : s.status;
+    const statusLabel = s.kind === "human" ? (HUMAN_STATE[s.entry.status] || {}).label
+      : s.kind === "pause" ? (PAUSE_STATE[s.entry.status] || {}).label
+      : s.status === "failed" ? "error" : s.status;
 
     detailEl.dataset.sid = s.id;
     detailEl.dataset.tab = detailTab;
@@ -991,7 +1076,9 @@
           `<button role="tab" data-tab="${t}" aria-selected="${t === detailTab}"${t !== "metadata" && !secs[t].length ? ` class="empty-tab" title="Nothing recorded"` : ""}>${t[0].toUpperCase() + t.slice(1)}</button>`).join("") +
       `</div><div class="tab-body" role="tabpanel"></div>`;
     detailEl.querySelector("h2").textContent = s.kind === "node" ? s.name
-      : s.kind === "human" ? `Message to ${index.get(s.nodeId).node.name}` : `${s.name} · ${index.get(s.nodeId).node.name}`;
+      : s.kind === "human" ? `Message to ${index.get(s.nodeId).node.name}`
+      : s.kind === "pause" ? `${s.entry.pauseKind === "input" ? "Input" : "Approval"} for ${index.get(s.nodeId).node.name}`
+      : `${s.name} · ${index.get(s.nodeId).node.name}`;
     if (s.kind === "node" && rec.toolErrors) detailEl.querySelector(".sub").insertAdjacentHTML("beforeend", ` <span class="b err">⚠${rec.toolErrors}</span>`);
 
     const body = detailEl.querySelector(".tab-body");
@@ -1097,7 +1184,7 @@
   // trace replaces the streamed one, keeping selection, focus and open groups (reload).
 
   const LIVE_TICK_MS = 1000;      // how often running bars grow in the trace view between events
-  const LIVE_PASS = ["speed", "jitter", "drop"]; // page query params forwarded to the mock server
+  const LIVE_PASS = ["speed", "jitter", "drop", "pauses"]; // page query params forwarded to the mock server
   const LIVE_LABEL = { connecting: "Connecting…", live: "Live", reconnecting: "Reconnecting…", completed: "Run complete", error: "Disconnected" };
   const LIVE_DOT = { connecting: "pending", live: "running", reconnecting: "pending", completed: "done", error: "failed" };
   const structural = new Set();   // nodes that gained children since the last flush
@@ -1110,6 +1197,7 @@
     if (q.get("stream")) return q.get("stream");
     const pass = new URLSearchParams();
     LIVE_PASS.forEach((k) => { if (q.has(k)) pass.set(k, q.get(k)); });
+    if (!pass.has("pauses")) pass.set("pauses", "1"); // the demo shows approvals unless ?pauses=0
     return `/runs/demo-${Date.now().toString(36)}/events` + (pass.size ? "?" + pass : "");
   }
 
@@ -1235,9 +1323,9 @@
     if (!root || root.placeholder) { load(workflow); return; }
     const toTrace = (id) => (id && index.get(id)?.node.traceId) || null;
     const back = (t) => (t && byTraceId.get(t)) || null;
-    // Span ids are a node id, "t:<tool call id>", "h:<message id>", "hc:<client msg id>", or
+    // Span ids are a node id, "t:<tool call id>", "h:<message id>", "hc:<client msg id>", "p:<pause id>", or
     // "<node id>:<kind><n>" (see buildSpans); only the last kind embeds an internal id.
-    const STABLE = /^(t|h|hc):/;
+    const STABLE = /^(t|h|hc|p):/;
     const spanTo = (sid) => {
       if (!sid || STABLE.test(sid)) return sid;
       const i = sid.indexOf(":");
@@ -1252,7 +1340,7 @@
     };
     const treeWrap = treeEl.parentElement;
     const saved = {
-      treeOpen: [...treeEl.querySelectorAll("details[open] > summary > .node")].map((el) => toTrace(el.dataset.id)),
+      treeOpen: openTreeIds().map(toTrace),
       sel: toTrace(selectedId),
       focus: toTrace(focusId),
       traceOpen: [...traceOpen].map(toTrace),
@@ -1307,13 +1395,14 @@
     if (live.done) return "The run has finished.";
     const st = records.get(id).status;
     if (st === "pending") return "This agent hasn't started yet.";
-    if (st !== "running") return "This agent has finished; messages only reach running agents.";
+    if (st !== "running" && st !== "waiting") return "This agent has finished; messages only reach running agents.";
     return null;
   }
 
-  function messagesUrl() {
+  // Other endpoints of the live run sit next to its stream: <run>/events -> <run>/<path>.
+  function liveEndpoint(path) {
     const u = new URL(live.url, location.href);
-    u.pathname = u.pathname.replace(/\/events\/?$/, "/messages");
+    u.pathname = u.pathname.replace(/\/events\/?$/, "/" + path);
     u.search = "";
     return u.toString();
   }
@@ -1333,7 +1422,7 @@
     humanByClient.set(`${clientId}|${nodeId}`, e);
     drawNow(nodeId);
     try {
-      const r = await fetch(messagesUrl(), {
+      const r = await fetch(liveEndpoint("messages"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ targets: [node.traceId], text, mode: "steer", client_msg_id: clientId, author: viewerName() }),
@@ -1372,7 +1461,8 @@
       ta.disabled = !!blocked;
       ta.placeholder = blocked || "Steer this agent… Enter to send, Shift+Enter for a new line";
       btn.disabled = !!blocked || !ta.value.trim();
-      note.textContent = error || (blocked ? "" : "The agent reads it at its next step.");
+      note.textContent = error || (blocked ? "" : records.get(target).status === "waiting"
+        ? "This agent is paused; it reads your message after it continues." : "The agent reads it at its next step.");
       note.classList.toggle("err", !!error);
     }
 
@@ -1407,6 +1497,161 @@
   const treeComposer = createComposer();
   const traceComposer = createComposer();
   spanPanel.append(traceComposer.el);
+
+  // ---------- approvals ----------
+  // When an agent pauses before a tool call, a card under the detail panel asks for a decision:
+  // Approve / Reject for an approval, or fields with Submit / Skip call for an input request. The
+  // header button counts waiting agents and jumps between them. Answers are POSTed to
+  // <run>/pauses/<id>; the card closes when the stream reports the pause resolved, by anyone.
+
+  const pauseDrafts = new Map(); // pause_id -> { values, note } typed but not yet sent
+  const baseTitle = document.title;
+  const errText = (err) => (err instanceof TypeError ? "Couldn't reach the server." : err.message);
+
+  function pauseSummary(e) {
+    const by = e.by ? (e.by === viewerName() ? "you" : e.by) : "someone";
+    const verb = { approved: "Approved", rejected: e.pauseKind === "input" ? "Skipped" : "Rejected", submitted: "Answered" }[e.status] || e.status;
+    const vals = e.values ? " · " + Object.entries(e.values).map(([k, v]) => `${k}: ${v}`).join(", ") : "";
+    return `${verb} by ${by}${vals}${e.note ? ` · “${e.note}”` : ""}`;
+  }
+
+  function updateWaiting() {
+    const agents = new Set([...openPauses.values()].map((e) => e.nodeId)).size;
+    const btn = $("#waitingBtn");
+    btn.hidden = !agents;
+    btn.textContent = `⏸ ${agents} agent${agents === 1 ? "" : "s"} waiting`;
+    document.title = openPauses.size ? `(${openPauses.size}) ${baseTitle}` : baseTitle;
+  }
+
+  // Next waiting agent after the selected one.
+  $("#waitingBtn").addEventListener("click", () => {
+    const list = [...openPauses.values()];
+    if (!list.length) return;
+    const i = list.findIndex((e) => e.nodeId === selectedId);
+    reveal(list[(i + 1) % list.length]);
+  });
+
+  function reveal(pause) {
+    const id = pause.nodeId;
+    if (focusId && !isUnder(id, focusId)) focusId = null;
+    if (view === "trace") {
+      buildSpans();
+      openAncestors("p:" + pause.pauseId);
+      renderTrace({ rebuild: false });
+      selectSpan("p:" + pause.pauseId, true);
+    } else {
+      const openIds = new Set(openTreeIds());
+      pathTo(id).slice(0, -1).forEach((a) => openIds.add(a.id));
+      render({ openIds });
+      showPanel(id);
+      treeEl.querySelector(`.node[data-id="${id}"]`)?.scrollIntoView({ block: "nearest" });
+    }
+    (view === "trace" ? tracePause : treePause).focus();
+  }
+
+  function createPauseCard() {
+    const el = document.createElement("section");
+    el.className = "pause-card";
+    el.hidden = true;
+    let pause = null;
+    let form, msg, buttons;
+
+    function build() {
+      const p = pause;
+      const draft = pauseDrafts.get(p.pauseId) || { values: {}, note: "" };
+      const input = p.pauseKind === "input";
+      el.innerHTML =
+        `<div class="pc-badge">⏸ ${input ? "Input needed" : "Approval needed"}</div><p class="pc-prompt"></p>` +
+        `<details class="pc-call"><summary>Tool call: <code></code></summary><pre></pre></details>` +
+        `<form class="pc-form"><div class="pc-fields"></div>` +
+        `<label><span>Note <span class="muted">(optional)</span></span><input name="note" maxlength="500" autocomplete="off"></label>` +
+        `<div class="pc-actions"><span class="pc-msg"></span>` +
+        `<button type="button" data-decision="reject">${input ? "Skip call" : "Reject"}</button>` +
+        `<button type="submit" class="primary" data-decision="${input ? "submit" : "approve"}">${input ? "Submit" : "Approve"}</button></div></form>`;
+      el.querySelector(".pc-prompt").textContent = p.prompt;
+      el.querySelector(".pc-call code").textContent = p.toolName || "tool";
+      el.querySelector(".pc-call pre").textContent = p.toolArgs == null ? "(no arguments)" : fmtVal(p.toolArgs);
+      el.querySelector(".pc-call").open = !input; // an approval is about these arguments, so show them
+      form = el.querySelector("form");
+      msg = el.querySelector(".pc-msg");
+      buttons = el.querySelectorAll("button");
+      const fieldsEl = el.querySelector(".pc-fields");
+      p.fields.forEach((f) => {
+        const label = document.createElement("label");
+        label.textContent = f.description || f.name;
+        const inp = document.createElement("input");
+        inp.name = "field:" + f.name;
+        inp.required = !!f.required;
+        inp.maxLength = 1000;
+        inp.autocomplete = "off";
+        inp.value = draft.values[f.name] ?? f.default ?? "";
+        label.append(inp);
+        fieldsEl.append(label);
+      });
+      form.elements.note.value = draft.note;
+      form.addEventListener("input", () => pauseDrafts.set(p.pauseId, collect()));
+      form.addEventListener("submit", (e) => { e.preventDefault(); send(input ? "submit" : "approve"); });
+      el.querySelector('[data-decision="reject"]').addEventListener("click", () => send("reject"));
+    }
+
+    function collect() {
+      const values = {};
+      pause.fields.forEach((f) => { values[f.name] = form.elements["field:" + f.name].value; });
+      return { values, note: form.elements.note.value };
+    }
+
+    async function send(decision) {
+      const p = pause;
+      if (!p || p.sending || !live || live.done) return;
+      if (decision === "submit" && !form.reportValidity()) return;
+      const { values, note } = collect();
+      p.sending = decision;
+      p.error = null;
+      sync();
+      try {
+        const r = await fetch(liveEndpoint("pauses/" + encodeURIComponent(p.pauseId)), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ decision, values: decision === "submit" ? values : undefined, note: note.trim() || undefined, author: viewerName() }),
+        });
+        if (!r.ok) throw new Error((await r.json().catch(() => null))?.error || `HTTP ${r.status}`);
+        pauseDrafts.delete(p.pauseId); // stays "Sending…" until the stream reports it resolved
+      } catch (err) {
+        p.sending = null;
+        p.error = errText(err);
+      }
+      if (pause === p) sync();
+    }
+
+    function sync() {
+      const p = pause;
+      const ended = !live || live.done;
+      el.querySelectorAll("input, button").forEach((c) => { c.disabled = !!p.sending || ended; });
+      msg.textContent = p.error || (p.sending ? "Sending…" : ended ? "The run has ended." : "");
+      msg.className = "pc-msg" + (p.error ? " err" : " muted");
+    }
+
+    // Shows the oldest open pause of node `id`, if any. The form is only rebuilt when the pause
+    // shown changes, so typing survives live redraws.
+    function update(id) {
+      const next = id ? [...openPauses.values()].find((e) => e.nodeId === id) : null;
+      if (!next) { pause = null; el.hidden = true; el.replaceChildren(); return; }
+      if (next !== pause) { pause = next; build(); }
+      el.hidden = false;
+      sync();
+    }
+
+    function focus() {
+      if (!pause || el.hidden) return;
+      (el.querySelector(".pc-fields input") || el.querySelector('button[type="submit"]'))?.focus();
+    }
+
+    return { el, update, focus };
+  }
+
+  const treePause = createPauseCard();
+  const tracePause = createPauseCard();
+  spanPanel.insertBefore(tracePause.el, traceComposer.el);
 
   // ---------- helpers ----------
 

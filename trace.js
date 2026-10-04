@@ -109,6 +109,15 @@
   //   { seq, node_id, type: "human", event: "human.delivered" | "human.expired", message_id, completed_at }
   // "delivered" means the agent read it (at its next turn); "expired" means it finished first.
   // They are sent with POST <events url minus /events>/messages (see mock-server.js).
+  //
+  // An agent can pause before a tool call to ask for approval ("confirm") or input ("input"):
+  //   { seq, node_id, type: "pause", event: "pause.requested", pause_id, kind, prompt, tool_call_id, tool_name, tool_args?,
+  //     fields?: [{ name, type: "string", description, required, default? }], started_at }
+  //   { seq, event: "<type>.paused", node: { node_id, status: "paused" } }
+  //   { seq, node_id, type: "pause", event: "pause.resolved", pause_id, decision: "approved" | "rejected" | "submitted",
+  //     values?, note?, resolved_by?, completed_at }
+  //   { seq, event: "<type>.continued", node: { node_id, status: "running" } }
+  // Answered with POST <events url minus /events>/pauses/<pause_id>; the first answer wins.
   // `seq` increases by one per event so a reconnect can resume from Last-Event-ID.
 
   const NODE_FINAL_FIELDS = ["status", "completed_at", "metrics"];

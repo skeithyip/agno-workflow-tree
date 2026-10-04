@@ -9,8 +9,11 @@
 //                              speed=N   compress the recorded run N times (default 20, ~1 min)
 //                              jitter=1  send some nodes' start late, after their first events
 //                              drop=N    close the connection after N events (tests reconnect)
+//                              pauses=1  pause agents before a tool call for approval or input
 //   POST /runs/:id/messages  steer running agents: { targets: [node_id], text, mode?: "steer",
 //                            client_msg_id?, author? } -> 202 { messages: [{ message_id, node_id }] }
+//   POST /runs/:id/pauses/:pause_id  answer a pause: { decision: "approve" | "reject" | "submit",
+//                            values?: { field: text }, note?, author? } -> 200; 409 if already answered
 //   GET  /runs/:id/final     the finished trace (FINAL_OUTPUT shape); 409 while still running
 //   GET  /*                  static files from this directory
 //
@@ -18,6 +21,11 @@
 // with the same seq, including other viewers' messages. The mock can't change what an agent
 // does: a message is marked delivered at the agent's next tool result (where a real agent would
 // next call the model) or expired if the agent finishes first.
+//
+// With pauses=1, the 1st, 3rd, ... agents that call tools stop before their first
+// mcp_execute_tool call to ask for approval, and the 2nd, 4th, ... ask which source to query.
+// The recorded run is sequential, so a pause holds the whole run: later events are shifted by
+// however long it waited. Rejecting skips that tool call; submitted input is merged into its args.
 //
 // Usage: node mock-server.js   (PORT env var, default 8787), then open http://localhost:8787/
 const http = require("http");
@@ -28,7 +36,9 @@ const { traceToStream, retimeTrace, createTraceStore } = require("./trace.js");
 const ROOT = __dirname;
 const HEARTBEAT_MS = 2000;
 const STEERABLE = new Set(["agent", "team"]);
-const LIMITS = { body: 64 * 1024, text: 4000, targets: 50, id: 100, author: 80 };
+const FINISHED = new Set(["completed", "failed", "error", "cancelled"]);
+const DECISIONS = { confirm: { approve: "approved", reject: "rejected" }, input: { submit: "submitted", reject: "rejected" } };
+const LIMITS = { body: 64 * 1024, text: 4000, targets: 50, id: 100, author: 80, value: 1000, note: 500 };
 const TYPES = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".json": "application/json", ".png": "image/png", ".svg": "image/svg+xml" };
 
 // trace-data.js is `window.FINAL_OUTPUT = {...};` — read it as JSON rather than evaluating it.
@@ -39,7 +49,7 @@ function loadFinalOutput(file = path.join(ROOT, "trace-data.js")) {
 
 // ---------- runs ----------
 
-function createRun(source, id, { speed = 20, jitter = false } = {}) {
+function createRun(source, id, { speed = 20, jitter = false, pauses = false } = {}) {
   const t0 = Date.parse(source.created_at);
   const start = Date.now() + 300;
   const shifted = retimeTrace(source, (t) => start + (t - t0) / speed, 1 / speed);
@@ -54,16 +64,45 @@ function createRun(source, id, { speed = 20, jitter = false } = {}) {
     clients: new Set(),
     queued: new Map(),       // node_id -> message_ids not yet delivered
     msgCount: 0,
+    pause: null,             // the pause holding the run, if any
+    pauses: new Map(),       // pause_id -> pause
     done: false,
   };
+  if (pauses) markPauses(schedule);
   pump(run);
   return run;
 }
 
-// Send every scheduled event whose time has come, then sleep until the next one.
+// Picks each tool-calling agent's first mcp_execute_tool call (or first call) as a pause point.
+function markPauses(schedule) {
+  const agents = new Set(), seen = new Set();
+  schedule.forEach(({ evt }) => { if (evt.node && evt.node.type === "agent") agents.add(evt.node.node_id); });
+  let k = 0;
+  agents.forEach((nodeId) => {
+    const calls = schedule.filter((it) => it.evt.node_id === nodeId && it.evt.type === "tool_start");
+    const it = calls.find((c) => c.evt.tool_name === "mcp_execute_tool") || calls[0];
+    if (!it || seen.has(it)) return;
+    seen.add(it);
+    const kind = k++ % 2 === 0 ? "confirm" : "input";
+    it.pause = { kind };
+    if (kind === "input") {
+      const current = it.evt.tool_args && it.evt.tool_args.args && it.evt.tool_args.args.source;
+      it.pause.fields = [{ name: "source", type: "string", description: "Which data source should it query?", required: true, ...(current ? { default: current } : {}) }];
+    }
+  });
+}
+
+// Send every scheduled event whose time has come, then sleep until the next one. Stops at a
+// pause point until the pause is answered.
 function pump(run) {
   clearTimeout(run.timer);
-  while (run.next < run.schedule.length && run.schedule[run.next].ts <= Date.now()) emit(run, run.schedule[run.next++].evt);
+  if (run.pause) return;
+  while (run.next < run.schedule.length && run.schedule[run.next].ts <= Date.now()) {
+    const it = run.schedule[run.next];
+    if (it.pause && !it.pause.done) { requestPause(run, it); return; }
+    run.next++;
+    emit(run, it.evt);
+  }
   if (run.next < run.schedule.length) run.timer = setTimeout(() => pump(run), run.schedule[run.next].ts - Date.now());
 }
 
@@ -76,7 +115,7 @@ function emit(run, evt) {
 
   // Delivery: a tool result is where the agent next goes back to the model.
   if (e.type === "tool_end") settle(run, e.node_id, "delivered");
-  else if (e.node && e.node.status && e.node.status !== "running") settle(run, e.node.node_id, "expired");
+  else if (e.node && FINISHED.has(e.node.status)) settle(run, e.node.node_id, "expired");
 }
 
 function settle(run, nodeId, outcome) {
@@ -84,6 +123,76 @@ function settle(run, nodeId, outcome) {
   if (!ids) return;
   run.queued.delete(nodeId);
   ids.forEach((message_id) => emit(run, { node_id: nodeId, type: "human", event: `human.${outcome}`, message_id, completed_at: new Date().toISOString() }));
+}
+
+function requestPause(run, it) {
+  const { node_id, tool_call_id, tool_name, tool_args } = it.evt;
+  const node = run.store.node(node_id);
+  const p = { id: `p_${run.pauses.size + 1}`, item: it, kind: it.pause.kind, fields: it.pause.fields, nodeId: node_id, since: Date.now(), answer: null };
+  run.pause = p;
+  run.pauses.set(p.id, p);
+  const prompt = p.kind === "confirm" ? `${node.name} wants to run ${tool_name}.` : `${node.name} needs input before running ${tool_name}.`;
+  const evt = { node_id, type: "pause", event: "pause.requested", pause_id: p.id, kind: p.kind, prompt, tool_call_id, tool_name, started_at: new Date(p.since).toISOString() };
+  if (tool_args !== undefined) evt.tool_args = tool_args;
+  if (p.fields) evt.fields = p.fields;
+  emit(run, evt);
+  emit(run, { event: `${node.type}.paused`, node: { node_id, status: "paused" } });
+}
+
+// Validates an answer to a pause and lets the run continue. Returns [status, body].
+function answerPause(run, pauseId, body) {
+  const fail = (status, error) => [status, { error }];
+  const p = run.pauses.get(pauseId);
+  if (!p) return fail(404, "No such pause in this run.");
+  if (p.answer) return fail(409, `Already ${p.answer.decision}${p.answer.by ? " by " + p.answer.by : ""}.`);
+  const { decision, values, note, author } = body || {};
+  const outcome = DECISIONS[p.kind][decision];
+  if (!outcome) return fail(400, `decision must be ${Object.keys(DECISIONS[p.kind]).map((d) => `"${d}"`).join(" or ")}.`);
+  if (note != null && (typeof note !== "string" || note.length > LIMITS.note)) return fail(400, "note is invalid.");
+  if (author != null && (typeof author !== "string" || author.length > LIMITS.author)) return fail(400, "author is invalid.");
+  let clean;
+  if (decision === "submit") {
+    if (!values || typeof values !== "object" || Array.isArray(values)) return fail(400, "values are required.");
+    const names = new Set(p.fields.map((f) => f.name));
+    const extra = Object.keys(values).find((k) => !names.has(k));
+    if (extra) return fail(400, `Unknown field "${extra}".`);
+    clean = {};
+    for (const f of p.fields) {
+      const v = values[f.name];
+      if (v != null && (typeof v !== "string" || v.length > LIMITS.value)) return fail(400, `${f.name} is invalid.`);
+      if (f.required && !(v || "").trim()) return fail(400, `${f.name} is required.`);
+      if (v != null) clean[f.name] = v.trim();
+    }
+  }
+
+  // Everything still to come happens later by however long the run waited.
+  const delta = Date.now() - p.since;
+  for (let i = run.next; i < run.schedule.length; i++) {
+    const it = run.schedule[i];
+    it.ts += delta;
+    it.evt = retimeTrace(it.evt, (t) => t + delta);
+  }
+  p.answer = { decision: outcome, by: author };
+  p.item.pause.done = true;
+
+  const evt = { node_id: p.nodeId, type: "pause", event: "pause.resolved", pause_id: p.id, decision: outcome, completed_at: new Date().toISOString() };
+  if (clean) evt.values = clean;
+  if (note && note.trim()) evt.note = note.trim();
+  if (author) evt.resolved_by = author;
+  emit(run, evt);
+  emit(run, { event: `${run.store.node(p.nodeId).type}.continued`, node: { node_id: p.nodeId, status: "running" } });
+
+  const callId = p.item.evt.tool_call_id;
+  if (outcome === "rejected") {
+    // The call never happens: drop its start and end.
+    run.schedule = run.schedule.filter((it, i) => i < run.next || !(it.evt.node_id === p.nodeId && it.evt.tool_call_id === callId));
+  } else if (clean) {
+    const a = p.item.evt.tool_args || {};
+    p.item.evt.tool_args = a.args && typeof a.args === "object" ? { ...a, args: { ...a.args, ...clean } } : { ...a, ...clean };
+  }
+  run.pause = null;
+  pump(run);
+  return [200, { pause_id: p.id, decision: outcome }];
 }
 
 // Validates a steering request and queues one message per target. Returns [status, body].
@@ -104,7 +213,7 @@ function postMessages(run, body) {
     const n = run.store.node(t);
     if (!n) return fail(404, "No such node in this run.", { node_id: t });
     if (!STEERABLE.has(n.type)) return fail(422, `A ${n.type} can't take messages; send to an agent.`, { node_id: t });
-    if (n.status !== "running") return fail(409, `${n.name} is not running.`, { node_id: t });
+    if (n.status !== "running" && n.status !== "paused") return fail(409, `${n.name} is not running.`, { node_id: t });
   }
 
   const sentAt = new Date().toISOString();
@@ -194,16 +303,17 @@ function createServer({ source = loadFinalOutput(), log = () => {} } = {}) {
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, "http://localhost");
     if (url.pathname === "/favicon.ico") { res.writeHead(204).end(); return; }
-    const m = url.pathname.match(/^\/runs\/([^/]+)\/(events|final|messages)$/);
+    const m = url.pathname.match(/^\/runs\/([^/]+)\/(events|final|messages|pauses\/[^/]+)$/);
     if (!m) { serveStatic(req, res, url.pathname); return; }
     const id = decodeURIComponent(m[1]);
-    const route = `${req.method} ${m[2]}`;
+    const pauseId = m[2].startsWith("pauses/") ? decodeURIComponent(m[2].slice(7)) : null;
+    const route = `${req.method} ${pauseId ? "pause" : m[2]}`;
 
     if (route === "GET events") {
       const q = url.searchParams;
       let run = runs.get(id);
       if (!run) {
-        run = createRun(source, id, { speed: Math.max(0.01, +q.get("speed") || 20), jitter: q.get("jitter") === "1" });
+        run = createRun(source, id, { speed: Math.max(0.01, +q.get("speed") || 20), jitter: q.get("jitter") === "1", pauses: q.get("pauses") === "1" });
         runs.set(id, run);
         log(`run ${id}: ${run.schedule.length} events over ${((run.schedule.at(-1).ts - Date.now()) / 1000).toFixed(1)}s`);
       }
@@ -229,7 +339,16 @@ function createServer({ source = loadFinalOutput(), log = () => {} } = {}) {
       });
       return;
     }
-    res.writeHead(405, { Allow: m[2] === "messages" ? "POST" : "GET" }).end();
+    if (route === "POST pause") {
+      if (!run) { json(res, 404, { error: "Unknown run." }); return; }
+      readJson(req, res, (body) => {
+        const [status, out] = answerPause(run, pauseId, body);
+        if (status === 200) log(`run ${id}: pause ${pauseId} ${out.decision}`);
+        json(res, status, out);
+      });
+      return;
+    }
+    res.writeHead(405, { Allow: m[2] === "messages" || pauseId ? "POST" : "GET" }).end();
   });
   server.on("close", () => runs.forEach((r) => clearTimeout(r.timer)));
   return server;

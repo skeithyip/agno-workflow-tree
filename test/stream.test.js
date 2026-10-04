@@ -267,3 +267,83 @@ test("steering: delivered at the next tool result, expired if the agent finishes
     server.close();
   }
 });
+
+// ---------- pauses (approval and input) ----------
+
+test("pauses: run waits for an answer; approve, submit input and reject each take effect", async () => {
+  const server = createServer({ source: FINAL });
+  await new Promise((r) => server.listen(0, r));
+  const base = `http://localhost:${server.address().port}`;
+  const answer = (pid, body, type) => fetch(`${base}/runs/hitl/pauses/${pid}`, { method: "POST", headers: { "Content-Type": type || "application/json" }, body: JSON.stringify(body) })
+    .then(async (r) => ({ status: r.status, body: await r.json().catch(() => null) }));
+  const byName = (name) => FINAL.nodes.find((n) => n.name === name).node_id;
+  const events = [];
+  const seen = {};
+  try {
+    await follow(`${base}/runs/hitl/events?speed=400&pauses=1`, async (evt) => {
+      events.push(evt);
+      if (evt.event !== "pause.requested") return;
+      const node = FINAL.nodes.find((n) => n.node_id === evt.node_id).name;
+      seen[node] = evt;
+      await new Promise((r) => setTimeout(r, 100)); // the run should hold while nobody answers
+
+      if (node === "Collector: Source Discovery") {
+        assert.equal(evt.kind, "confirm");
+        assert.equal((await answer(evt.pause_id, { decision: "submit", values: {} })).status, 400, "confirm takes approve/reject");
+        assert.equal((await answer(evt.pause_id, { decision: "approve" }, "text/plain")).status, 415);
+        // A steering message to a paused agent is accepted and delivered after it continues.
+        seen.msg = await post(base, "hitl", { targets: [evt.node_id], text: "Use recent data", author: "Tester" });
+        assert.equal(seen.msg.status, 202);
+        assert.equal((await answer(evt.pause_id, { decision: "approve", author: "Tester" })).status, 200);
+        const again = await answer(evt.pause_id, { decision: "reject", author: "Other" });
+        assert.equal(again.status, 409);
+        assert.match(again.body.error, /Already approved by Tester/);
+      } else if (node === "Expert: Trends") {
+        assert.equal(evt.kind, "input");
+        assert.equal(evt.fields[0].name, "source");
+        assert.equal(evt.fields[0].default, "dataset-05");
+        assert.equal((await answer(evt.pause_id, { decision: "submit", values: { source: " " } })).status, 400, "required");
+        assert.equal((await answer(evt.pause_id, { decision: "submit", values: { source: "x", other: "y" } })).status, 400, "unknown field");
+        assert.equal((await answer(evt.pause_id, { decision: "submit", values: { source: "dataset-99" }, note: "  newer  " })).status, 200);
+      } else if (node === "Expert: Sentiment") {
+        assert.equal(evt.kind, "confirm");
+        assert.equal((await answer(evt.pause_id, { decision: "reject", note: "Not this one" })).status, 200);
+      }
+    });
+    assert.deepEqual(Object.keys(seen).filter((k) => k !== "msg").sort(), ["Collector: Source Discovery", "Expert: Sentiment", "Expert: Trends"]);
+    assert.equal((await answer("p_99", { decision: "approve" })).status, 404);
+
+    const after = (pause) => events.slice(events.findIndex((e) => e.event === "pause.resolved" && e.pause_id === pause.pause_id));
+    // Each pause flips the agent to paused and back, and nothing from the recorded run is sent
+    // between the request and its answer (only the steering message we posted meanwhile).
+    for (const p of [seen["Collector: Source Discovery"], seen["Expert: Trends"], seen["Expert: Sentiment"]]) {
+      const i = events.indexOf(p);
+      assert.deepEqual(events[i + 1].node, { node_id: p.node_id, status: "paused" });
+      const j = events.findIndex((e) => e.event === "pause.resolved" && e.pause_id === p.pause_id);
+      const during = events.slice(i + 2, j);
+      assert.ok(during.every((e) => e.event === "human.message"), `sent while paused: ${during.map((e) => e.event || e.type)}`);
+      assert.equal(events[j + 1].node.status, "running");
+    }
+    // Approved: the call runs. Input: its args carry the answer. Rejected: the call never runs.
+    const starts = events.filter((e) => e.type === "tool_start");
+    assert.ok(starts.some((e) => e.tool_call_id === seen["Collector: Source Discovery"].tool_call_id));
+    assert.equal(starts.find((e) => e.tool_call_id === seen["Expert: Trends"].tool_call_id).tool_args.args.source, "dataset-99");
+    assert.ok(!events.some((e) => e.tool_call_id === seen["Expert: Sentiment"].tool_call_id && e.type !== "pause"));
+    const trendsResolved = after(seen["Expert: Trends"])[0];
+    assert.deepEqual(trendsResolved.values, { source: "dataset-99" });
+    assert.equal(trendsResolved.note, "newer");
+    // The steering message wasn't expired by the pause.
+    const mid = seen.msg.body.messages[0].message_id;
+    assert.ok(events.some((e) => e.event === "human.delivered" && e.message_id === mid));
+    // Timestamps stay in order across pauses (later events were shifted by the wait).
+    const times = events.filter((e) => e.type === "tool_start").map((e) => Date.parse(e.started_at));
+    times.forEach((t, i) => i && assert.ok(t >= times[i - 1]));
+
+    const final = await (await fetch(`${base}/runs/hitl/final`)).json();
+    assert.deepEqual(fold(events).snapshot(), final);
+    assert.ok(final.nodes.every((n) => n.status === "completed"));
+    assert.equal(final.nodes.find((n) => n.node_id === byName("Expert: Trends")).messages.filter((m) => m.type === "pause").length, 2);
+  } finally {
+    server.close();
+  }
+});
