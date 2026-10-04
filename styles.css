@@ -52,7 +52,7 @@ body {
 .bar h1 { margin: 0; font-size: 16px; }
 .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .controls label { display: flex; gap: 6px; align-items: center; color: var(--muted); }
-button, select, input {
+button, select, input, textarea {
   font: inherit; color: var(--text); background: var(--surface);
   border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px;
 }
@@ -306,3 +306,24 @@ code { font-size: 12px; }
 
 /* Live stream status */
 .live-status { white-space: nowrap; font-size: 12px; }
+
+/* Steering: message box and messages */
+.d-main { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.composer {
+  flex: none; display: flex; flex-direction: column; gap: 6px;
+  border-top: 1px solid var(--line); margin-top: 8px; padding-top: 10px;
+}
+.composer[hidden] { display: none; }
+.composer-label { font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
+.composer textarea { width: 100%; resize: vertical; min-height: 52px; max-height: 40vh; line-height: 1.4; }
+.composer textarea:disabled { opacity: .6; }
+.composer-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.composer-note { font-size: 12px; }
+.composer-note.err { color: var(--failed); }
+.ev-human { border-left: 3px solid var(--accent); }
+.ev-human.failed { border-left-color: var(--failed); }
+.ev-human .who { display: block; margin-bottom: 2px; }
+.ev-human .h-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 4px; }
+.ev-human .h-err { color: var(--failed); font-size: 12px; }
+.ev-human .txt { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.wf-bar.k-human { background: var(--accent); }

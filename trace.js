@@ -102,6 +102,13 @@
   //   { seq, event: "<type>.completed" | "<type>.failed", node: { node_id, status, completed_at, metrics? } }
   //   { seq, event: "run.completed", run: { completed_at, total_* }, final_url? }
   // plus `event: heartbeat` with { server_time_ms } every few seconds (no id).
+  //
+  // Steering messages are ordinary messages of type "human" on the agent they were sent to, so
+  // they end up in that node's `messages` in FINAL_OUTPUT:
+  //   { seq, node_id, type: "human", event: "human.message", message_id, client_msg_id?, author?, text, mode: "steer", started_at }
+  //   { seq, node_id, type: "human", event: "human.delivered" | "human.expired", message_id, completed_at }
+  // "delivered" means the agent read it (at its next turn); "expired" means it finished first.
+  // They are sent with POST <events url minus /events>/messages (see mock-server.js).
   // `seq` increases by one per event so a reconnect can resume from Last-Event-ID.
 
   const NODE_FINAL_FIELDS = ["status", "completed_at", "metrics"];
@@ -244,6 +251,7 @@
     return {
       apply,
       snapshot: () => trace,
+      node: (id) => byId.get(id),
       get lastSeq() { return lastSeq; },
       get pending() { let c = 0; waiting.forEach((l) => (c += l.length)); orphans.forEach((l) => (c += l.length)); return c; },
     };

@@ -165,3 +165,105 @@ test("final trace is not served while the run is in progress", async () => {
     server.close();
   }
 });
+
+// ---------- steering ----------
+
+// Reads an SSE response incrementally, calling onEvent(evt) for each trace event.
+async function follow(url, onEvent) {
+  const res = await fetch(url);
+  assert.equal(res.status, 200);
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) return;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n\n")) >= 0) {
+      const [f] = parseSse(buf.slice(0, i + 2));
+      buf = buf.slice(i + 2);
+      if (f && f.event === "trace") await onEvent(JSON.parse(f.data));
+    }
+  }
+}
+
+const post = (base, id, body, type = "application/json") =>
+  fetch(`${base}/runs/${id}/messages`, { method: "POST", headers: { "Content-Type": type }, body: typeof body === "string" ? body : JSON.stringify(body) })
+    .then(async (r) => ({ status: r.status, body: await r.json().catch(() => null) }));
+
+test("steering: delivered at the next tool result, expired if the agent finishes, seen by every viewer", async () => {
+  const server = createServer({ source: FINAL });
+  await new Promise((r) => server.listen(0, r));
+  const base = `http://localhost:${server.address().port}`;
+  const byName = (name) => FINAL.nodes.find((n) => n.name === name).node_id;
+  const collector = byName("Collector: Source Discovery"); // makes 100 tool calls
+  const orchestrator = byName("Orchestrator");              // makes none: messages expire
+  const step = byName("data_collection");
+  const checks = {};
+  try {
+    assert.equal((await post(base, "nope", { targets: [collector], text: "hi" })).status, 404);
+
+    const viewerA = [], viewerB = [];
+    const url = `${base}/runs/steer/events?speed=200`;
+    const a = follow(url, async (evt) => {
+      viewerA.push(evt);
+      if (evt.event === "agent.started" && evt.node.node_id === collector) {
+        checks.ok = await post(base, "steer", { targets: [collector], text: "Prefer EU sources", client_msg_id: "c_1", author: "Tester" });
+        checks.step = await post(base, "steer", { targets: [step], text: "x" });
+        checks.empty = await post(base, "steer", { targets: [collector], text: "  " });
+        checks.noTargets = await post(base, "steer", { targets: [], text: "x" });
+        checks.unknown = await post(base, "steer", { targets: ["no-such-node"], text: "x" });
+        checks.form = await post(base, "steer", "text=x", "application/x-www-form-urlencoded");
+        checks.badJson = await post(base, "steer", "{", "application/json");
+        checks.mode = await post(base, "steer", { targets: [collector], text: "x", mode: "interrupt" });
+      }
+      if (evt.event === "agent.started" && evt.node.node_id === orchestrator) {
+        checks.late = await post(base, "steer", { targets: [orchestrator], text: "Wrap up quickly" });
+        checks.finished = await post(base, "steer", { targets: [collector], text: "too late" });
+      }
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    const b = follow(url, (evt) => { viewerB.push(evt); });
+    await Promise.all([a, b]);
+
+    assert.equal(checks.ok.status, 202);
+    assert.equal(checks.ok.body.messages[0].node_id, collector);
+    assert.equal(checks.step.status, 422);
+    assert.equal(checks.empty.status, 400);
+    assert.equal(checks.noTargets.status, 400);
+    assert.equal(checks.unknown.status, 404);
+    assert.equal(checks.form.status, 415);
+    assert.equal(checks.badJson.status, 400);
+    assert.equal(checks.mode.status, 400);
+    assert.equal(checks.late.status, 202);
+    assert.equal(checks.finished.status, 409);
+    assert.equal((await post(base, "steer", { targets: [orchestrator], text: "x" })).status, 409, "run finished");
+
+    // Both viewers saw the same events with the same seq.
+    assert.deepEqual(viewerB, viewerA);
+
+    const human = viewerA.filter((e) => e.type === "human");
+    const sent = human.find((e) => e.event === "human.message" && e.node_id === collector);
+    assert.equal(sent.client_msg_id, "c_1");
+    assert.equal(sent.author, "Tester");
+    const delivered = human.find((e) => e.event === "human.delivered" && e.message_id === sent.message_id);
+    assert.ok(delivered, "collector message delivered");
+    const next = viewerA.slice(viewerA.indexOf(sent) + 1).find((e) => e.node_id === collector && e.type === "tool_end");
+    assert.ok(next.seq < delivered.seq, "delivered right after the agent's next tool result");
+    const expired = human.find((e) => e.event === "human.expired");
+    assert.equal(expired.message_id, checks.late.body.messages[0].message_id);
+    assert.equal(human.length, 4);
+
+    // The final trace has the messages on their agents, and folding the stream rebuilds it.
+    const final = await (await fetch(`${base}/runs/steer/final`)).json();
+    const msgs = final.nodes.find((n) => n.node_id === collector).messages.filter((m) => m.type === "human");
+    assert.deepEqual(msgs.map((m) => m.event), ["human.message", "human.delivered"]);
+    assert.equal(msgs[0].node_id, undefined, "stored like other messages, without node_id or seq");
+    assert.deepEqual(fold(viewerA).snapshot(), final);
+    // ...and a finished trace with messages replays through traceToStream unchanged.
+    assert.deepEqual(fold(traceToStream(final).map((it) => it.evt)).snapshot(), final);
+  } finally {
+    server.close();
+  }
+});

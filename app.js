@@ -20,12 +20,24 @@
   const ICON = { workflow: "◆", step: "▸", agent: "●", team: "◎", parallel: "∥", loop: "↻", condition: "?", router: "⇄" };
   const FLUSH_MS = 300;     // how often queued events are drawn
   const PANEL_LIMIT = 200;  // max timeline entries kept on screen
+  const STEERABLE = new Set(["agent", "team"]); // node types that take steering messages
+  const HUMAN_MAX = 4000;   // longest steering message (the server enforces the same)
+  // Steering message delivery states: the status dot to show and a label.
+  const HUMAN_STATE = {
+    sending: { dot: "pending", label: "sending…" },
+    queued: { dot: "running", label: "waiting for agent" },
+    delivered: { dot: "done", label: "delivered" },
+    expired: { dot: "pending", label: "not delivered", title: "The agent finished before reading it" },
+    failed: { dot: "failed", label: "not sent" },
+  };
 
   let root;               // the nested workflow
   let index = new Map();  // internal id -> { node, parent }
   let byTraceId = new Map(); // trace node_id -> internal id (for live/replay events)
   let records = new Map();// internal id -> run state and entries (see newRecord)
   let entries = [];       // all timeline entries, in arrival order
+  let humanById = new Map();     // message_id -> steering entry (for delivery updates)
+  let humanByClient = new Map(); // "client_msg_id|node id" -> entry sent from here, until the server echoes it
   let focusId = null;     // when set, only this subtree is shown
   let selectedId = null;
   let includeChildren = false;
@@ -39,7 +51,7 @@
   let eventCount = 0;
   let flushCount = 0;
 
-  const newRecord = () => ({ status: "pending", start: null, end: null, tools: 0, toolErrors: 0, reasoning: 0, entries: [], open: {} });
+  const newRecord = () => ({ status: "pending", start: null, end: null, tools: 0, toolErrors: 0, reasoning: 0, human: 0, entries: [], open: {} });
   const ms = (iso) => (iso ? Date.parse(iso) : null);
 
   function mapStatus(s) {
@@ -79,6 +91,8 @@
     records = new Map();
     index.forEach((_, id) => records.set(id, newRecord()));
     entries = [];
+    humanById = new Map();
+    humanByClient = new Map();
     eventCount = 0;
     flushCount = 0;
   }
@@ -178,6 +192,22 @@
         addEntry(id, { kind: "tool", name: evt.tool_name, callId: evt.tool_call_id, args: null, status: failed ? "failed" : "done", result: evt.result, start: ms(evt.started_at), end: ms(evt.completed_at), ts: ms(evt.completed_at) });
       }
       if (failed) rec.toolErrors++;
+    } else if (t === "human") {
+      // A steering message. One sent from this page is already shown (status "sending"); the
+      // server's echo is matched to it by client_msg_id instead of adding a second entry.
+      if (evt.event === "human.message") {
+        const key = evt.client_msg_id && `${evt.client_msg_id}|${id}`;
+        let e = key && humanByClient.get(key);
+        if (e) humanByClient.delete(key);
+        else { rec.human++; e = addEntry(id, { kind: "human", text: evt.text || "", author: evt.author, mode: evt.mode, clientId: evt.client_msg_id }); }
+        Object.assign(e, { status: "queued", messageId: evt.message_id, start: ms(evt.started_at), ts: ms(evt.started_at), error: null });
+        e.ver++;
+        if (evt.message_id) humanById.set(evt.message_id, e);
+      } else {
+        const e = humanById.get(evt.message_id);
+        const outcome = evt.event.split(".").pop();
+        if (e && (outcome === "delivered" || outcome === "expired")) { e.status = outcome; e.end = ms(evt.completed_at); e.ver++; }
+      }
     } else if (t === "content") {
       const structured = evt.content_type && evt.content_type !== "str" ? evt.data : null;
       addEntry(id, { kind: "content", text: evt.text || "", data: structured, contentType: evt.content_type, ts: ms(evt.completed_at || evt.started_at) });
@@ -296,6 +326,7 @@
     if (rec.reasoning) h += `<span class="b" title="reasoning blocks">💭</span>`;
     if (rec.tools) h += `<span class="b" title="tool calls">🔧${rec.tools}</span>`;
     if (rec.toolErrors) h += `<span class="b err" title="failed tool calls">⚠${rec.toolErrors}</span>`;
+    if (rec.human) h += `<span class="b" title="steering messages">💬${rec.human}</span>`;
     if (rec.start && rec.end) h += `<span class="b dur">${fmtDur(rec.end - rec.start)}</span>`;
     return h;
   }
@@ -387,7 +418,7 @@
     const tl = document.createElement("div");
     tl.className = "timeline";
 
-    panelEl.replaceChildren(h, sub, info, head, hidden, tl);
+    panelEl.replaceChildren(h, sub, info, head, hidden, tl, treeComposer.el);
     renderPanelLive();
     tl.scrollTop = 0; // start at the first event; live updates still stick to the bottom
   }
@@ -419,6 +450,7 @@
   function renderPanelLive() {
     const rec = records.get(selectedId);
     const node = index.get(selectedId).node;
+    treeComposer.update(selectedId);
     panelEl.querySelector(".sub").innerHTML =
       `<span class="type t-${node.type}">${node.type}</span> <span class="pill st-${rec.status}"><span class="dot"></span>${rec.status}</span>` +
       (rec.start && rec.end ? ` <span class="muted">${fmtDur(rec.end - rec.start)}</span>` : "");
@@ -491,6 +523,16 @@
       el.querySelector("summary").innerHTML = `${who(e)}🔧 <code>${escapeHtml(e.name || "tool")}</code> ${state}`;
     } else if (e.kind === "content" && e.data) {
       el.querySelector("summary").innerHTML = `${who(e)}📦 structured output <span class="muted">· ${escapeHtml(e.contentType)}</span>`;
+    } else if (e.kind === "human") {
+      const st = HUMAN_STATE[e.status] || HUMAN_STATE.queued;
+      el.classList.toggle("failed", e.status === "failed");
+      el.innerHTML = who(e) +
+        `<div class="h-head">💬 <strong></strong> <span class="pill st-${st.dot}"${st.title ? ` title="${st.title}"` : ""}><span class="dot"></span>${st.label}</span>` +
+        (e.start && e.end ? ` <span class="muted">after ${fmtDur(e.end - e.start)}</span>` : "") + ` <span class="h-err"></span></div><p class="txt"></p>`;
+      el.querySelector("strong").textContent = authorLabel(e);
+      el.querySelector(".h-err").textContent = e.error || "";
+      el.querySelector(".txt").textContent = e.text;
+      return;
     } else if (e.kind === "error") {
       el.innerHTML = who(e) + `⚠ <span class="txt"></span>`;
       el.querySelector(".txt").textContent = e.text;
@@ -542,7 +584,7 @@
   const ROW_H = 28;          // must match .span height in styles.css
   const OVERSCAN = 8;        // extra rows drawn above and below the viewport
   const MAX_CHARS = 20000;   // longer values are cut until "Show all" is clicked
-  const LEAF_ICON = { tool: "🔧", reasoning: "💭", error: "⚠" };
+  const LEAF_ICON = { tool: "🔧", reasoning: "💭", error: "⚠", human: "💬" };
 
   const treeViewEl = $("#treeView");
   const traceViewEl = $("#traceView");
@@ -550,6 +592,9 @@
   const spanCanvas = $("#spanCanvas");
   const axisEl = $("#axis");
   const spanPanel = $("#spanPanel");
+  const detailEl = document.createElement("div"); // redrawn by renderDetail; the message box below it is not
+  detailEl.className = "d-main";
+  spanPanel.append(detailEl);
 
   let view = "tree";
   let spans = new Map();     // span id -> span (rebuilt from records on each refresh)
@@ -593,16 +638,18 @@
       spans.set(s.id, s);
       see(s.start); see(s.end);
       const kids = (node.children || []).map((k) => nodeSpan(k, depth + 1, s));
-      const n = { tool: 0, reasoning: 0, error: 0 };
+      const n = { tool: 0, reasoning: 0, error: 0, human: 0 };
       rec.entries.forEach((e) => {
         if (!(e.kind in n)) return; // content is shown as the node's Output
-        let id = e.kind === "tool" && e.callId ? "t:" + e.callId : `${node.id}:${e.kind}${n[e.kind]}`;
+        let id = e.kind === "tool" && e.callId ? "t:" + e.callId
+          : e.kind === "human" ? (e.messageId ? "h:" + e.messageId : "hc:" + e.clientId)
+          : `${node.id}:${e.kind}${n[e.kind]}`;
         n[e.kind]++;
         if (spans.has(id)) id += "#" + e.uid;
+        if (e.kind === "human" && e.messageId && traceSel === "hc:" + e.clientId) traceSel = id; // server confirmed it
         const leaf = {
           id, kind: e.kind, entry: e, nodeId: node.id, depth: depth + 1, parent: s, children: [],
-          name: e.kind === "tool" ? e.name || "tool" : e.kind === "reasoning" ? "Reasoning" : "Error",
-          status: e.kind === "tool" ? e.status : e.kind === "reasoning" ? (e.done ? "done" : "running") : "failed",
+          ...leafLabel(e),
           start: e.start ?? e.ts ?? null,
           end: e.end ?? (e.kind === "error" ? e.ts : null),
         };
@@ -622,6 +669,15 @@
     const t0 = spanRoot.start ?? tMin;
     const t1 = Math.max(tMax, spanRoot.end ?? -Infinity);
     win = isFinite(t0) && isFinite(t1) && t1 > t0 ? { t0, t1 } : { t0: isFinite(t0) ? t0 : 0, t1: (isFinite(t0) ? t0 : 0) + 1 };
+  }
+
+  function leafLabel(e) {
+    switch (e.kind) {
+      case "tool": return { name: e.name || "tool", status: e.status };
+      case "reasoning": return { name: "Reasoning", status: e.done ? "done" : "running" };
+      case "human": return { name: `${authorLabel(e)}: ${e.text.split("\n")[0].slice(0, 120)}`, status: (HUMAN_STATE[e.status] || HUMAN_STATE.queued).dot };
+      default: return { name: "Error", status: "failed" };
+    }
   }
 
   const isOpen = (s) => errorsOnly || traceOpen.has(s.id);
@@ -786,6 +842,7 @@
 
   function inputOf(s) {
     if (s.kind === "tool") return s.entry.args != null ? [{ label: "Arguments", value: s.entry.args }] : [];
+    if (s.kind === "human") return [{ label: `Message from ${authorLabel(s.entry)}`, value: s.entry.text }];
     return [];
   }
 
@@ -794,6 +851,7 @@
     if (s.kind === "tool") return e.result !== undefined ? [{ label: s.status === "failed" ? "Error" : "Result", value: e.result }] : [];
     if (s.kind === "reasoning") return e.steps.length ? [{ label: "Reasoning", value: e.steps.join("\n\n") }] : [];
     if (s.kind === "error") return [{ label: "Error", value: e.text }];
+    if (s.kind === "human") return [];
     const out = [];
     records.get(s.nodeId).entries.forEach((c) => {
       if (c.kind === "error") out.push({ label: "Error", value: c.text });
@@ -810,6 +868,17 @@
       if (s.kind === "node") return `This trace doesn't record inputs for ${s.node.type} spans.`;
       return `${s.kind === "reasoning" ? "Reasoning" : "An error"} has no separate input; see Output.`;
     }
+    if (s.kind === "human") {
+      const e = s.entry;
+      const after = e.start && e.end ? ` ${fmtDur(e.end - e.start)} after it was sent` : "";
+      return {
+        sending: "Sending…",
+        queued: "Waiting for the agent's next step to read it.",
+        delivered: `The agent read this${after}. A message has no output of its own; the agent's later spans show its effect.`,
+        expired: `The agent finished without reading this message${e.start && e.end ? ` (${fmtDur(e.end - e.start)} after it was sent)` : ""}.`,
+        failed: `Not sent: ${e.error || "unknown error"}`,
+      }[e.status] || "";
+    }
     if (s.status === "running") return "Still running…";
     return s.kind === "node" && s.children.length ? "No output recorded for this span itself; select a child span." : "No output recorded.";
   }
@@ -823,6 +892,7 @@
       if (s.start != null) add("offset", "+" + (fmtDur(s.start - win.t0) || "0ms"));
       add("tool calls", rec.tools + (rec.toolErrors ? ` (${rec.toolErrors} failed)` : ""));
       add("reasoning blocks", rec.reasoning);
+      if (rec.human) add("steering messages", rec.human);
       add("child nodes", (s.node.children || []).length);
       return dl;
     }
@@ -834,15 +904,19 @@
       dl.append(dt, dd);
     };
     const iso = (t) => (t != null ? new Date(t).toISOString() : null);
-    add("kind", s.kind === "tool" ? "tool call" : s.kind);
+    const e = s.entry;
+    const human = s.kind === "human";
+    add("kind", s.kind === "tool" ? "tool call" : human ? "steering message" : s.kind);
     if (s.kind === "tool") add("tool", s.name);
-    add("status", s.status);
-    if (s.start != null && s.end != null) add("duration", fmtDur(s.end - s.start));
+    if (human) { add("from", e.author || "unknown"); add("mode", e.mode); }
+    add("status", human ? (HUMAN_STATE[e.status] || {}).label : s.status);
+    if (s.start != null && s.end != null) add(human ? "waited" : "duration", fmtDur(s.end - s.start));
     if (s.start != null) add("offset", "+" + (fmtDur(s.start - win.t0) || "0ms"));
-    add("started", iso(s.start));
-    add("completed", iso(s.end));
-    if (s.kind === "reasoning") add("steps", s.entry.steps.length);
-    add("tool call id", s.entry.callId);
+    add(human ? "sent" : "started", iso(s.start));
+    add(human ? (e.status === "expired" ? "expired" : "delivered") : "completed", iso(s.end));
+    if (s.kind === "reasoning") add("steps", e.steps.length);
+    add("tool call id", e.callId);
+    if (human) { add("message id", e.messageId); add("client id", e.clientId); add("error", e.error); }
     const node = index.get(s.nodeId).node;
     add("node", `${node.name} (${node.type})`);
     if (node.model_name || node.model) add("model", node.model_name || node.model);
@@ -881,27 +955,28 @@
 
   function renderDetail() {
     const s = traceSel && spans.get(traceSel);
+    traceComposer.update(s ? s.nodeId : null);
     if (!s) {
-      delete spanPanel.dataset.sid;
-      spanPanel.innerHTML = `<p class="muted">${traceSel ? "This span isn't in the current view." : "Select a span to see its input, output and metadata."}</p>`;
+      delete detailEl.dataset.sid;
+      detailEl.innerHTML = `<p class="muted">${traceSel ? "This span isn't in the current view." : "Select a span to see its input, output and metadata."}</p>`;
       return;
     }
     // Keep scroll position and keyboard focus across live redraws of the same span and tab.
-    const oldBody = spanPanel.querySelector(".tab-body");
-    const sameView = spanPanel.dataset.sid === s.id && spanPanel.dataset.tab === detailTab;
+    const oldBody = detailEl.querySelector(".tab-body");
+    const sameView = detailEl.dataset.sid === s.id && detailEl.dataset.tab === detailTab;
     const keepScroll = sameView && oldBody ? oldBody.scrollTop : 0;
     const act = document.activeElement;
-    const refocus = act && spanPanel.contains(act) ? (act.dataset.nav ? `[data-nav="${act.dataset.nav}"]` : act.dataset.tab ? `[data-tab="${act.dataset.tab}"]` : null) : null;
+    const refocus = act && detailEl.contains(act) ? (act.dataset.nav ? `[data-nav="${act.dataset.nav}"]` : act.dataset.tab ? `[data-tab="${act.dataset.tab}"]` : null) : null;
 
     const idx = rows.indexOf(s);
     const secs = { input: inputOf(s), output: outputOf(s) };
     const rec = records.get(s.nodeId);
     const dur = s.start != null && s.end != null ? fmtDur(s.end - s.start) : "";
-    const statusLabel = s.status === "failed" ? "error" : s.status;
+    const statusLabel = s.kind === "human" ? (HUMAN_STATE[s.entry.status] || {}).label : s.status === "failed" ? "error" : s.status;
 
-    spanPanel.dataset.sid = s.id;
-    spanPanel.dataset.tab = detailTab;
-    spanPanel.innerHTML =
+    detailEl.dataset.sid = s.id;
+    detailEl.dataset.tab = detailTab;
+    detailEl.innerHTML =
       `<div class="d-head"><h2></h2><div class="d-nav">` +
         `<button data-nav="-1" title="Previous span (↑ or k)" ${idx <= 0 ? "disabled" : ""}>‹ Prev</button>` +
         `<span class="muted">${idx >= 0 ? idx + 1 : "–"} / ${rows.length}</span>` +
@@ -915,14 +990,15 @@
         ["input", "output", "metadata"].map((t) =>
           `<button role="tab" data-tab="${t}" aria-selected="${t === detailTab}"${t !== "metadata" && !secs[t].length ? ` class="empty-tab" title="Nothing recorded"` : ""}>${t[0].toUpperCase() + t.slice(1)}</button>`).join("") +
       `</div><div class="tab-body" role="tabpanel"></div>`;
-    spanPanel.querySelector("h2").textContent = s.kind === "node" ? s.name : `${s.name} · ${index.get(s.nodeId).node.name}`;
-    if (s.kind === "node" && rec.toolErrors) spanPanel.querySelector(".sub").insertAdjacentHTML("beforeend", ` <span class="b err">⚠${rec.toolErrors}</span>`);
+    detailEl.querySelector("h2").textContent = s.kind === "node" ? s.name
+      : s.kind === "human" ? `Message to ${index.get(s.nodeId).node.name}` : `${s.name} · ${index.get(s.nodeId).node.name}`;
+    if (s.kind === "node" && rec.toolErrors) detailEl.querySelector(".sub").insertAdjacentHTML("beforeend", ` <span class="b err">⚠${rec.toolErrors}</span>`);
 
-    const body = spanPanel.querySelector(".tab-body");
+    const body = detailEl.querySelector(".tab-body");
     if (detailTab === "metadata") body.append(metaDl(s));
     else fillSections(body, s, detailTab, secs[detailTab]);
     body.scrollTop = keepScroll;
-    if (refocus) spanPanel.querySelector(refocus + ":not(:disabled)")?.focus();
+    if (refocus) detailEl.querySelector(refocus + ":not(:disabled)")?.focus();
   }
 
   spanPanel.addEventListener("click", (e) => {
@@ -1159,15 +1235,17 @@
     if (!root || root.placeholder) { load(workflow); return; }
     const toTrace = (id) => (id && index.get(id)?.node.traceId) || null;
     const back = (t) => (t && byTraceId.get(t)) || null;
-    // Span ids are a node id, "t:<tool call id>", or "<node id>:<kind><n>" (see buildSpans).
+    // Span ids are a node id, "t:<tool call id>", "h:<message id>", "hc:<client msg id>", or
+    // "<node id>:<kind><n>" (see buildSpans); only the last kind embeds an internal id.
+    const STABLE = /^(t|h|hc):/;
     const spanTo = (sid) => {
-      if (!sid || sid.startsWith("t:")) return sid;
+      if (!sid || STABLE.test(sid)) return sid;
       const i = sid.indexOf(":");
       const t = toTrace(i < 0 ? sid : sid.slice(0, i));
       return t && (i < 0 ? t : t + sid.slice(i));
     };
     const spanBack = (sid) => {
-      if (!sid || sid.startsWith("t:")) return sid;
+      if (!sid || STABLE.test(sid)) return sid;
       const i = sid.indexOf(":");
       const id = back(i < 0 ? sid : sid.slice(0, i));
       return id && (i < 0 ? id : id + sid.slice(i));
@@ -1200,6 +1278,135 @@
       showPanel(selectedId);
     }
   }
+
+  // ---------- steering ----------
+  // A message box under each detail panel for the selected agent while a run is live. Sending
+  // shows the message at once ("sending"), POSTs it, and the server's echo in the stream turns it
+  // into a normal "human" entry whose delivery state then updates (see ingest and trace.js).
+
+  const drafts = new Map(); // trace node id -> unsent text, shared by both panels
+  let myName = null;
+
+  // Placeholder identity until the real backend supplies one from sign-in.
+  function viewerName() {
+    if (myName) return myName;
+    try { myName = localStorage.getItem("agno-viewer-name"); } catch {}
+    if (!myName) {
+      myName = "Viewer " + Math.random().toString(36).slice(2, 6);
+      try { localStorage.setItem("agno-viewer-name", myName); } catch {}
+    }
+    return myName;
+  }
+  const authorLabel = (e) => (e.author && e.author === viewerName() ? "You" : e.author || "Someone");
+
+  // undefined: no message box (not live, or not an agent); a string: disabled, with that
+  // reason; null: can send.
+  function steerBlocker(id) {
+    const entry = id && index.get(id);
+    if (!live || !entry || !STEERABLE.has(entry.node.type)) return undefined;
+    if (live.done) return "The run has finished.";
+    const st = records.get(id).status;
+    if (st === "pending") return "This agent hasn't started yet.";
+    if (st !== "running") return "This agent has finished; messages only reach running agents.";
+    return null;
+  }
+
+  function messagesUrl() {
+    const u = new URL(live.url, location.href);
+    u.pathname = u.pathname.replace(/\/events\/?$/, "/messages");
+    u.search = "";
+    return u.toString();
+  }
+
+  function drawNow(id) {
+    dirty.add(id);
+    if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+    flush();
+  }
+
+  async function sendHuman(nodeId, text) {
+    const node = index.get(nodeId).node;
+    const clientId = "c_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    const now = Date.now() + live.skew;
+    records.get(nodeId).human++;
+    const e = addEntry(nodeId, { kind: "human", text, author: viewerName(), mode: "steer", clientId, status: "sending", start: now, ts: now });
+    humanByClient.set(`${clientId}|${nodeId}`, e);
+    drawNow(nodeId);
+    try {
+      const r = await fetch(messagesUrl(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ targets: [node.traceId], text, mode: "steer", client_msg_id: clientId, author: viewerName() }),
+      });
+      if (!r.ok) throw new Error((await r.json().catch(() => null))?.error || `HTTP ${r.status}`);
+    } catch (err) {
+      const reason = err instanceof TypeError ? "Couldn't reach the server." : err.message; // fetch's network errors are TypeErrors
+      if (e.status === "sending") { e.status = "failed"; e.error = reason; e.ver++; drawNow(nodeId); }
+      throw new Error(reason);
+    }
+  }
+
+  function createComposer() {
+    const el = document.createElement("form");
+    el.className = "composer";
+    el.hidden = true;
+    el.innerHTML =
+      `<label class="composer-label"></label><textarea rows="2" maxlength="${HUMAN_MAX}"></textarea>` +
+      `<div class="composer-row"><span class="composer-note muted"></span><button type="submit" class="primary">Send</button></div>`;
+    const label = el.querySelector("label");
+    const ta = el.querySelector("textarea");
+    const note = el.querySelector(".composer-note");
+    const btn = el.querySelector("button");
+    ta.id = "composer-" + Math.random().toString(36).slice(2, 8);
+    label.htmlFor = ta.id;
+    let target = null, blocked, error = "";
+    const key = (id = target) => index.get(id)?.node.traceId || id;
+
+    function update(id = target) {
+      if (id !== target) { target = id; error = ""; }
+      blocked = steerBlocker(target);
+      el.hidden = blocked === undefined;
+      if (el.hidden) return;
+      if (document.activeElement !== ta) ta.value = drafts.get(key()) || "";
+      label.textContent = `Message ${index.get(target).node.name}`;
+      ta.disabled = !!blocked;
+      ta.placeholder = blocked || "Steer this agent… Enter to send, Shift+Enter for a new line";
+      btn.disabled = !!blocked || !ta.value.trim();
+      note.textContent = error || (blocked ? "" : "The agent reads it at its next step.");
+      note.classList.toggle("err", !!error);
+    }
+
+    ta.addEventListener("input", () => {
+      if (ta.value) drafts.set(key(), ta.value); else drafts.delete(key());
+      error = "";
+      update();
+    });
+    ta.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); el.requestSubmit(); }
+    });
+    el.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const text = ta.value.trim();
+      if (!text || blocked !== null) return;
+      const to = target, k = key();
+      ta.value = "";
+      drafts.delete(k);
+      update();
+      sendHuman(to, text).catch((err) => {
+        if (!drafts.get(k)) drafts.set(k, text); // give the text back so it can be resent
+        if (target === to) {
+          if (!ta.value) ta.value = text;
+          error = `Not sent: ${err.message}`;
+          update();
+        }
+      });
+    });
+    return { el, update };
+  }
+
+  const treeComposer = createComposer();
+  const traceComposer = createComposer();
+  spanPanel.append(traceComposer.el);
 
   // ---------- helpers ----------
 
