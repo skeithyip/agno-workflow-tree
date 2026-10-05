@@ -17,6 +17,7 @@
       <label>Dataset
         <select id="dataset">
           <option value="trace">Research workflow (trace)</option>
+          <option value="production">Production output (sample data)</option>
           <option value="large">Synthetic (stress test)</option>
           <option value="live">Live stream (SSE)</option>
         </select>
@@ -31,9 +32,23 @@
   </header>
 
   <nav id="crumbs" class="crumbs" aria-label="Focus path"></nav>
+  <div id="overview" class="overview" aria-label="Steps at a glance" hidden></div>
 
   <main id="treeView" class="layout">
     <section class="tree-wrap" aria-label="Workflow">
+      <div class="tree-tools">
+        <span>Step + single agent:</span>
+        <div class="seg" role="group" aria-label="How a step with one agent is shown">
+          <button data-rows="stacked" aria-pressed="false" title="Two lines: the step, then its agent">Stacked</button>
+          <button data-rows="path" aria-pressed="false" title="One line: step › agent">Compact path</button>
+          <button data-rows="agent" aria-pressed="false" title="One line: the agent, with its step as context">Agent first</button>
+        </div>
+        <label><input id="treeCols" type="checkbox"> Columns &amp; timeline</label>
+      </div>
+      <div class="tree-head" aria-hidden="true" hidden>
+        <span class="th-name">Name</span>
+        <span class="cols"><span class="c-model">Model</span><span class="c-num">Tools</span><span class="c-num">Errors</span><span class="c-dur">Duration</span><span class="c-bar" title="Bars are scaled to the parent row's time span">Timeline (in parent)</span></span>
+      </div>
       <ul id="tree" class="tree" role="tree"></ul>
     </section>
     <aside id="panel" class="panel" aria-live="polite">
@@ -60,6 +75,7 @@
 
   <script src="data.js"></script>
   <script src="trace-data.js"></script>
+  <script src="sample-production.js"></script>
   <script src="trace.js"></script>
   <script src="app.js"></script>
 </body>

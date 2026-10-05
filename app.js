@@ -91,13 +91,28 @@
     resetRun();
     seedFromTrace();
     renderHeader();
-    render({ openDepth: defaultOpenDepth() });
+    render({ openIds: defaultOpenIds() });
     showPanel(null);
     resetTrace();
     updateWaiting();
   }
 
   const defaultOpenDepth = () => (index.size > 200 ? 1 : 4);
+
+  // Opened by default: the root and every ancestor of a step that is running, waiting for a
+  // decision, or failed. Everything else stays closed. Failed tool calls don't count here: agents
+  // recover from them, so opening for each one would open most of the tree.
+  function defaultOpenIds() {
+    const open = new Set([root.id]);
+    (function walk(node) {
+      const rec = records.get(node.id);
+      const hot = rec.status === "running" || rec.status === "waiting" || rec.status === "failed" || rec.openPauses > 0;
+      const kidHot = (node.children || []).map(walk).some(Boolean); // map, not some, so every branch is visited
+      if (kidHot) open.add(node.id);
+      return hot || kidHot;
+    })(root);
+    return open;
+  }
 
   function resetRun() {
     records = new Map();
@@ -293,11 +308,28 @@
     updateStats();
   }
 
+  // A step whose only child is one agent shows as a single "step › agent" row, so the wrapper
+  // doesn't cost a second row. The agent's children appear under that row.
+  const soloAgent = (node) => (node && node.type === "step" && node.children?.length === 1 && node.children[0].type === "agent" ? node.children[0] : null);
+  // The row that shows a node: its own row, or the merged row of the step it is merged into.
+  const rowEl = (id) => treeEl.querySelector(`.node[data-id="${id}"], .node[data-agent-id="${id}"]`);
+  const STATUS_RANK = { pending: 0, done: 1, waiting: 2, running: 3, failed: 4 };
+  // The record a row shows. A merged row combines the two: the agent's counts, the worse status,
+  // and the step's timing.
+  function rowRecord(node) {
+    const rec = records.get(node.id);
+    const agent = soloAgent(node);
+    if (!agent) return rec;
+    const arec = records.get(agent.id);
+    const status = (STATUS_RANK[rec.status] ?? 0) >= (STATUS_RANK[arec.status] ?? 0) ? rec.status : arec.status;
+    return { ...arec, status, start: rec.start ?? arec.start, end: rec.end ?? arec.end };
+  }
+
   function buildNode(node, depth, opts) {
     const li = document.createElement("li");
     li.setAttribute("role", "treeitem");
     const row = buildRow(node, opts);
-    const kids = node.children || [];
+    const kids = (soloAgent(node) || node).children || [];
 
     if (!kids.length) {
       row.classList.add("leaf");
@@ -315,6 +347,7 @@
       details.dataset.built = "1";
       const ul = document.createElement("ul");
       ul.setAttribute("role", "group");
+      if (["par", "batch"].includes(flowOf(kids)?.kind)) ul.classList.add("par");
       kids.forEach((k) => ul.append(buildNode(k, depth + 1, opts)));
       details.append(ul);
     };
@@ -328,61 +361,230 @@
   }
 
   function buildRow(node, opts) {
-    const rec = records.get(node.id);
+    if (rowStyle === "stacked") return buildStackedRow(node, opts);
+    const agent = soloAgent(node);
+    const body = agent || node;
+    const rec = rowRecord(node);
     const row = document.createElement("div");
     row.className = `node st-${rec.status}`;
     row.dataset.id = node.id;
-    if (node.id === selectedId) row.classList.add("selected");
-    if (chosen && chosen.has(node.id)) row.classList.add("recipient");
-    if (opts.hits && opts.hits.has(node.id)) row.classList.add("hit");
+    if (agent) row.dataset.agentId = agent.id;
+    markRow(row, agent ? [node.id, agent.id] : [node.id], opts);
 
-    const meta = node.model || node.evaluator || node.selector || node.endCondition || node.mode || "";
-    const kids = node.children || [];
+    const meta = metaOf(body);
+    const kids = body.children || [];
+    const flow = flowOf(kids);
+    const ico = (n) => `<span class="ico t-${n.type}" title="${n.type}">${ICON[n.type] || ""}</span>`;
+    // Steps and agents are the common case, so they get an icon; rarer types keep their label.
+    const tag = (n) => (n.type === "step" || n.type === "agent" ? ico(n) : `<span class="type t-${n.type}">${ICON[n.type] || ""} ${n.type}</span>`);
+    let label;
+    if (!agent) label = tag(node) + `<span class="name"></span>`;
+    else if (rowStyle === "path") label = ico(node) + `<span class="name minor step-part"></span><span class="sep">›</span>` + ico(agent) + `<span class="name agent-part"></span>`;
+    else label = ico(agent) + `<span class="name agent-part"></span><span class="ctx">in <span class="step-part"></span></span>`;
     row.innerHTML =
       `<span class="chev">›</span><span class="dot" title="status"></span>` +
-      `<span class="type t-${node.type}">${ICON[node.type] || ""} ${node.type}</span>` +
-      `<span class="name"></span>` +
-      (meta ? `<span class="meta"></span>` : "") +
-      `<span class="badges">${badgesHtml(rec)}</span>` +
-      (kids.length ? `<span class="count" title="nodes inside">${countDescendants(node)}</span>` : "");
-    row.querySelector(".name").textContent = node.name;
-    if (meta) row.querySelector(".meta").textContent = meta;
-
-    if (kids.length && node !== root && node.id !== focusId) {
-      const btn = document.createElement("button");
-      btn.className = "focus";
-      btn.textContent = "Focus";
-      btn.title = "Show only this group";
-      btn.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); setFocus(node.id); });
-      row.append(btn);
+      `<span class="label">${label}` +
+        (flow ? `<span class="flow" title="${flow.title}">${flow.text}</span>` : "") +
+        (kids.length ? `<span class="count" title="nodes inside">${countDescendants(body)}</span>` : "") +
+        (meta && !useCols() ? `<span class="meta"></span>` : "") +
+        `<span class="badges">${badgesHtml(rec)}</span>` +
+      `</span>`;
+    if (!agent) row.querySelector(".name").textContent = node.name;
+    else {
+      row.querySelector(".step-part").textContent = node.name;
+      row.querySelector(".step-part").title = `Step: ${node.name} (click to select the step)`;
+      row.querySelector(".agent-part").textContent = agent.name;
+      row.querySelector(".agent-part").title = `Agent: ${agent.name}`;
     }
+    row.querySelector(".meta")?.append(meta);
+    addFocusButton(row, node, body);
+    if (useCols()) row.insertAdjacentHTML("beforeend", `<span class="cols">${colsHtml(node, rec)}</span>`);
     return row;
   }
+
+  // The original two-line layout, kept for comparison.
+  function buildStackedRow(node, opts) {
+    const agent = soloAgent(node);
+    const body = agent || node;
+    const rec = rowRecord(node);
+    const row = document.createElement("div");
+    row.className = `node st-${rec.status}`;
+    row.dataset.id = node.id;
+    if (agent) row.dataset.agentId = agent.id;
+    markRow(row, agent ? [node.id, agent.id] : [node.id], opts);
+
+    const meta = metaOf(body);
+    const kids = body.children || [];
+    const typeTag = (n) => `<span class="type t-${n.type}">${ICON[n.type] || ""} ${n.type}</span>`;
+    const count = kids.length ? `<span class="count" title="nodes inside">${countDescendants(body)}</span>` : "";
+    // A merged row has two lines: the step, then its agent with the agent's details.
+    row.innerHTML = agent
+      ? `<span class="chev">›</span><span class="dot" title="status"></span>` +
+        `<div class="node-body">` +
+          `<div class="node-line">${typeTag(node)}<span class="name"></span>${count}</div>` +
+          `<div class="node-line sub">${typeTag(agent)}<span class="name agent-part"></span>${meta ? `<span class="meta"></span>` : ""}<span class="badges">${badgesHtml(rec)}</span></div>` +
+        `</div>`
+      : `<span class="chev">›</span><span class="dot" title="status"></span>` +
+        typeTag(node) + `<span class="name"></span>` + (meta ? `<span class="meta"></span>` : "") +
+        `<span class="badges">${badgesHtml(rec)}</span>` + count;
+    row.querySelector(".name").textContent = node.name;
+    if (agent) { row.querySelector(".name").title = node.name; row.querySelector(".agent-part").textContent = agent.name; }
+    if (meta) row.querySelector(".meta").textContent = meta;
+    addFocusButton(row, node, body);
+    return row;
+  }
+
+  const metaOf = (n) => n.model || n.evaluator || n.selector || n.endCondition || n.mode || "";
+
+  function markRow(row, ids, opts) {
+    if (ids.includes(selectedId)) row.classList.add("selected");
+    if (chosen && ids.some((i) => chosen.has(i))) row.classList.add("recipient");
+    if (opts.hits && ids.some((i) => opts.hits.has(i))) row.classList.add("hit");
+  }
+
+  function addFocusButton(row, node, body) {
+    if (!(body.children || []).length || node === root || node.id === focusId) return;
+    const btn = document.createElement("button");
+    btn.className = "focus";
+    btn.textContent = "Focus";
+    btn.title = "Show only this group";
+    btn.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); setFocus(node.id); });
+    row.append(btn);
+  }
+
+  // ---------- row style prototype ----------
+  // "stacked" is the original two-line merged row; "path" puts step › agent on one line (like
+  // VS Code's compact folders); "agent" leads with the agent and shows its step as context.
+
+  function pref(key, fallback) {
+    try { return localStorage.getItem("tree." + key) ?? fallback; } catch { return fallback; }
+  }
+  function savePref(key, value) {
+    try { localStorage.setItem("tree." + key, value); } catch { /* storage unavailable: setting lasts this page only */ }
+  }
+  let rowStyle = pref("rows", "path");
+  let showCols = pref("cols", "1") === "1";
+  const useCols = () => showCols && rowStyle !== "stacked";
+
+  // How a row's children ran: all at once, one after another, or in parallel batches.
+  // Worked out from timestamps, since the trace doesn't record a parallel step type.
+  function flowOf(kids) {
+    if (rowStyle === "stacked" || kids.length < 2) return null;
+    const recs = kids.map(rowRecord);
+    if (recs.some((r) => r.start == null)) return null;
+    const sorted = [...recs].sort((a, b) => a.start - b.start);
+    let batches = 1, overlaps = 0, batchEnd = sorted[0].end ?? Infinity;
+    for (const r of sorted.slice(1)) {
+      if (r.start < batchEnd - 1) { overlaps++; batchEnd = Math.max(batchEnd, r.end ?? Infinity); }
+      else { batches++; batchEnd = r.end ?? Infinity; }
+    }
+    if (!overlaps) return { kind: "seq", text: `→ ${kids.length}`, title: `${kids.length} ran one after another` };
+    if (batches === 1) return { kind: "par", text: `‖ ${kids.length}`, title: `${kids.length} ran at the same time` };
+    return { kind: "batch", text: `‖ ${batches} batches`, title: `${kids.length} children in ${batches} groups that ran at the same time` };
+  }
+
+  // The row a node's row sits under on screen (skipping an agent merged into its step).
+  function visualParent(node) {
+    let p = index.get(node.id).parent;
+    const gp = p && index.get(p.id).parent;
+    if (gp && soloAgent(gp) === p) p = gp;
+    return p;
+  }
+
+  const nowMs = () => Date.now() + (live && !live.done ? live.skew : 0);
+
+  // Bar showing when this row ran within its parent row's time span. On a merged row, the part
+  // before the agent started (step setup) is drawn lighter.
+  function rowBarHtml(node, rec) {
+    const top = focusId ? index.get(focusId).node : root;
+    const w = node === top ? rec : rowRecord(visualParent(node));
+    const now = nowMs();
+    const t0 = w.start, t1 = w.end ?? now;
+    if (t0 == null || rec.start == null || !(t1 > t0)) return "";
+    const pct = (t) => Math.min(100, Math.max(0, ((t - t0) / (t1 - t0)) * 100));
+    const seg = (a, b, cls) => `<i class="${cls}" style="left:${pct(a).toFixed(2)}%;width:${Math.max(0, pct(b) - pct(a)).toFixed(2)}%"></i>`;
+    const end = rec.end ?? now;
+    const agent = soloAgent(node);
+    const as = agent && records.get(agent.id).start;
+    if (as != null && as > rec.start) return seg(rec.start, as, "lead") + seg(as, end, "");
+    return seg(rec.start, end, "");
+  }
+
+  function colsHtml(node, rec) {
+    const agent = soloAgent(node);
+    const dur = rec.start != null && rec.end != null ? fmtDur(rec.end - rec.start) : rec.start != null ? "…" : "";
+    let durTitle = "";
+    if (agent) {
+      const a = records.get(agent.id);
+      const own = records.get(node.id);
+      const d = (r) => (r.start != null && r.end != null ? fmtDur(r.end - r.start) : "…");
+      durTitle = `step ${d(own)} · agent ${d(a)}` + (a.start != null && own.start != null ? ` · agent started ${fmtDur(a.start - own.start) || "0ms"} after step` : "");
+    }
+    return `<span class="c-model" title="${escapeHtml(metaOf(agent || node))}">${escapeHtml(metaOf(agent || node))}</span>` +
+      `<span class="c-num" title="tool calls">${rec.tools || ""}</span>` +
+      `<span class="c-num c-err" title="failed tool calls">${rec.toolErrors ? "⚠" + rec.toolErrors : ""}</span>` +
+      `<span class="c-dur" title="${durTitle}">${dur}</span>` +
+      `<span class="c-bar">${rowBarHtml(node, rec)}</span>`;
+  }
+
+  function applyRowStyle() {
+    document.querySelectorAll(".tree-tools [data-rows]").forEach((b) => b.setAttribute("aria-pressed", b.dataset.rows === rowStyle));
+    $("#treeCols").checked = showCols;
+    $("#treeCols").disabled = rowStyle === "stacked";
+    $(".tree-head").hidden = !useCols();
+    treeEl.classList.toggle("with-cols", useCols());
+    treeEl.classList.toggle("rows-compact", rowStyle !== "stacked");
+  }
+
+  function rerenderRows() {
+    applyRowStyle();
+    if (!root || view === "trace") return;
+    render({ openIds: new Set(openTreeIds()) });
+    if (selectedId) rowEl(selectedId)?.classList.add("selected");
+  }
+
+  document.querySelectorAll(".tree-tools [data-rows]").forEach((b) => b.addEventListener("click", () => {
+    rowStyle = b.dataset.rows;
+    savePref("rows", rowStyle);
+    rerenderRows();
+  }));
+  $("#treeCols").addEventListener("change", (e) => {
+    showCols = e.target.checked;
+    savePref("cols", showCols ? "1" : "0");
+    rerenderRows();
+  });
+  applyRowStyle();
 
   // Badges hold only numbers and fixed symbols, so innerHTML is safe here.
   function badgesHtml(rec) {
     let h = "";
     if (rec.reasoning) h += `<span class="b" title="reasoning blocks">💭</span>`;
-    if (rec.tools) h += `<span class="b" title="tool calls">🔧${rec.tools}</span>`;
-    if (rec.toolErrors) h += `<span class="b err" title="failed tool calls">⚠${rec.toolErrors}</span>`;
+    const cols = useCols();
+    if (rec.tools && !cols) h += `<span class="b" title="tool calls">🔧${rec.tools}</span>`;
+    if (rec.toolErrors && !cols) h += `<span class="b err" title="failed tool calls">⚠${rec.toolErrors}</span>`;
     if (rec.human) h += `<span class="b" title="steering messages">💬${rec.human}</span>`;
     if (rec.openPauses) h += `<span class="b wait" title="waiting for approval or input">⏸ needs you</span>`;
-    if (rec.start && rec.end) h += `<span class="b dur">${fmtDur(rec.end - rec.start)}</span>`;
+    if (rec.start && rec.end && !cols) h += `<span class="b dur">${fmtDur(rec.end - rec.start)}</span>`;
     return h;
   }
 
   function updateRow(id) {
-    const el = treeEl.querySelector(`.node[data-id="${id}"]`); // null if not rendered yet; fine
+    const entry = index.get(id);
+    if (!entry) return;
+    const owner = entry.parent && soloAgent(entry.parent) === entry.node ? entry.parent : entry.node;
+    const el = treeEl.querySelector(`.node[data-id="${owner.id}"]`); // null if not rendered yet; fine
     if (!el) return;
-    const rec = records.get(id);
+    const rec = rowRecord(owner);
     el.className = el.className.replace(/st-\w+/, "st-" + rec.status);
     const html = badgesHtml(rec);
     const b = el.querySelector(".badges");
     if (b.innerHTML !== html) b.innerHTML = html;
+    const c = el.querySelector(":scope > .cols");
+    if (c) c.innerHTML = colsHtml(owner, rec);
   }
 
   // Internal ids of tree groups currently open on screen.
-  const openTreeIds = () => [...treeEl.querySelectorAll("details[open] > summary > .node")].map((el) => el.dataset.id);
+  const openTreeIds = () => [...treeEl.querySelectorAll("details[open] > summary > .node")].flatMap((el) => [el.dataset.id, el.dataset.agentId].filter(Boolean));
 
   function renderCrumbs() {
     crumbsEl.replaceChildren();
@@ -413,6 +615,7 @@
   }
 
   function updateStats() {
+    renderOverview();
     if (view === "trace") { updateTraceStats(); return; }
     const rendered = treeEl.querySelectorAll(".node").length;
     const els = document.getElementsByTagName("*").length;
@@ -421,6 +624,55 @@
       (lastRenderMs ? ` · last full render ${lastRenderMs} ms` : "") +
       ` · ${eventCount} events` + (flushCount ? ` · ${flushCount} screen updates` : "");
   }
+
+  // ---------- overview ----------
+  // One segment per top-level step, sized by how long it ran, so the whole run reads at a glance.
+  // A segment with a failure gets a red top edge. Clicking one opens that step in the current view.
+  const overviewEl = $("#overview");
+
+  function hasFailure(node) {
+    const rec = records.get(node.id);
+    return rec.status === "failed" || rec.toolErrors > 0 || (node.children || []).some(hasFailure);
+  }
+
+  function renderOverview() {
+    const kids = (focusId ? index.get(focusId).node : root).children || [];
+    overviewEl.hidden = !kids.length;
+    if (!kids.length) return;
+    const now = Date.now() + (live && !live.done ? live.skew : 0);
+    overviewEl.replaceChildren(...kids.map((node) => {
+      const rec = records.get(node.id);
+      const end = rec.end ?? (rec.start != null ? now : null);
+      const w = rec.start != null && end != null ? Math.max(1, end - rec.start) : 1;
+      const failed = hasFailure(node);
+      const dur = rec.start != null && rec.end != null ? fmtDur(rec.end - rec.start) : "";
+      const b = document.createElement("button");
+      b.className = `seg-step st-${rec.status}` + (failed ? " has-err" : "");
+      b.dataset.id = node.id;
+      b.style.flex = `${w} 1 0`;
+      b.title = [node.name, dur, failed ? "has errors" : ""].filter(Boolean).join(" · ");
+      b.setAttribute("aria-label", b.title);
+      return b;
+    }));
+  }
+
+  overviewEl.addEventListener("click", (e) => {
+    const b = e.target.closest(".seg-step");
+    if (!b) return;
+    const id = b.dataset.id;
+    if (view === "trace") {
+      buildSpans();
+      openAncestors(id);
+      renderTrace({ rebuild: false });
+      selectSpan(id, true);
+    } else {
+      const openIds = new Set(openTreeIds());
+      pathTo(id).slice(0, -1).forEach((a) => openIds.add(a.id));
+      render({ openIds });
+      showPanel(id);
+      rowEl(id)?.scrollIntoView({ block: "nearest" });
+    }
+  });
 
   // ---------- details panel ----------
 
@@ -431,7 +683,7 @@
     selectedId = id;
     panelEls = new Map();
     if (!id) { panelEl.innerHTML = `<p class="muted">Select a node to see its details and events.</p>`; return; }
-    treeEl.querySelector(`.node[data-id="${id}"]`)?.classList.add("selected");
+    rowEl(id)?.classList.add("selected");
 
     const node = index.get(id).node;
     const h = document.createElement("h2");
@@ -633,9 +885,15 @@
   treeEl.addEventListener("click", (e) => {
     const row = e.target.closest(".node");
     if (!row) return;
-    if ((e.metaKey || e.ctrlKey) && !e.target.closest(".chev") && toggleRecipient(row.dataset.id)) { e.preventDefault(); return; }
+    // In one-line modes the agent is the row's subject; only the step's name selects the step.
+    let id = row.dataset.id;
+    if (row.dataset.agentId) {
+      if (rowStyle === "stacked") id = e.target.closest(".agent-part") ? row.dataset.agentId : row.dataset.id;
+      else id = e.target.closest(".step-part") ? row.dataset.id : row.dataset.agentId;
+    }
+    if ((e.metaKey || e.ctrlKey) && !e.target.closest(".chev") && toggleRecipient(id)) { e.preventDefault(); return; }
     if (!e.target.closest(".chev")) e.preventDefault(); // click row = select; chevron = expand
-    if (row.dataset.id !== selectedId) showPanel(row.dataset.id);
+    if (id !== selectedId) showPanel(id);
   });
 
   // ---------- trace view ----------
@@ -647,7 +905,8 @@
   const ROW_H = 28;          // must match .span height in styles.css
   const OVERSCAN = 8;        // extra rows drawn above and below the viewport
   const MAX_CHARS = 20000;   // longer values are cut until "Show all" is clicked
-  const LEAF_ICON = { tool: "🔧", reasoning: "💭", error: "⚠", human: "💬", pause: "⏸" };
+  const LEAF_ICON = { tool: "🔧", group: "🔧", reasoning: "💭", error: "⚠", human: "💬", pause: "⏸" };
+  const GROUP_MIN = 3;       // this many consecutive same-name tool calls share one group row
 
   const treeViewEl = $("#treeView");
   const traceViewEl = $("#traceView");
@@ -678,12 +937,7 @@
     spans = new Map();
     rows = [];
     fullShown = new Set();
-    traceOpen = new Set();
-    const depthLimit = defaultOpenDepth();
-    (function walk(node, d) {
-      if (d < depthLimit) traceOpen.add(node.id);
-      (node.children || []).forEach((k) => walk(k, d + 1));
-    })(root, 0);
+    traceOpen = defaultOpenIds();
     spanScroll.scrollTop = 0;
     if (view === "trace") renderTrace();
   }
@@ -694,6 +948,33 @@
     spans = new Map();
     let tMin = Infinity, tMax = -Infinity;
     const see = (t) => { if (t != null) { tMin = Math.min(tMin, t); tMax = Math.max(tMax, t); } };
+
+    // Runs of GROUP_MIN or more consecutive calls to the same tool become one collapsed row, so a
+    // step that made dozens of identical calls reads as a single line until it is opened.
+    function groupToolRuns(kids, parent, depth) {
+      const out = [];
+      let i = 0;
+      while (i < kids.length) {
+        let j = i + 1;
+        if (kids[i].kind === "tool") while (j < kids.length && kids[j].kind === "tool" && kids[j].name === kids[i].name) j++;
+        if (j - i < GROUP_MIN) { out.push(kids[i]); i++; continue; }
+        const run = kids.slice(i, j);
+        const status = run.some((c) => c.status === "failed") ? "failed" : run.some((c) => c.status === "running") ? "running" : "done";
+        const starts = run.map((c) => c.start).filter((t) => t != null);
+        const ends = run.map((c) => c.end ?? c.start).filter((t) => t != null);
+        const g = {
+          id: "g:" + run[0].id, kind: "group", name: `${run[0].name} ×${run.length}`, nodeId: parent.nodeId,
+          depth, parent, children: run, status, hasError: status === "failed",
+          start: starts.length ? Math.min(...starts) : null,
+          end: status === "running" || !ends.length ? null : Math.max(...ends),
+        };
+        run.forEach((c) => { c.parent = g; c.depth = depth + 1; c.hasError = c.status === "failed"; });
+        spans.set(g.id, g);
+        out.push(g);
+        i = j;
+      }
+      return out;
+    }
 
     function nodeSpan(node, depth, parent) {
       const rec = records.get(node.id);
@@ -722,9 +1003,9 @@
         kids.push(leaf);
       });
       kids.sort((a, b) => (a.start ?? Infinity) - (b.start ?? Infinity));
-      s.children = kids;
-      s.hasError = s.status === "failed" || kids.some((k) => k.hasError || k.status === "failed");
-      kids.forEach((k) => { if (k.hasError === undefined) k.hasError = k.status === "failed"; });
+      s.children = groupToolRuns(kids, s, depth + 1);
+      s.hasError = s.status === "failed" || s.children.some((k) => k.hasError || k.status === "failed");
+      s.children.forEach((k) => { if (k.hasError === undefined) k.hasError = k.status === "failed"; });
       return s;
     }
 
@@ -840,7 +1121,7 @@
     const end = s.end ?? (s.status === "running" || s.status === "waiting" ? win.t1 : s.start);
     const left = Math.min(100, Math.max(0, ((s.start - win.t0) / span) * 100));
     const width = Math.min(100 - left, Math.max(0, ((end - s.start) / span) * 100));
-    const cls = s.kind === "node" ? `k-node t-${s.node.type}` : `k-${s.kind}`;
+    const cls = s.kind === "node" ? `k-node t-${s.node.type}` : `k-${s.kind === "group" ? "tool" : s.kind}`;
     return `<span class="wf-bar ${cls}" style="left:${left.toFixed(3)}%;width:${width.toFixed(3)}%"></span>`;
   }
 
@@ -922,6 +1203,7 @@
   }
 
   function outputOf(s) {
+    if (s.kind === "group") return [{ label: "Calls", value: s.children.map((c) => `${c.name} · ${c.status} · ${c.start != null && c.end != null ? fmtDur(c.end - c.start) || "0ms" : "…"}`).join("\n") }];
     const e = s.entry;
     if (s.kind === "tool") return e.result !== undefined ? [{ label: s.status === "failed" ? "Error" : "Result", value: e.result }] : [];
     if (s.kind === "reasoning") return e.steps.length ? [{ label: "Reasoning", value: e.steps.join("\n\n") }] : [];
@@ -966,6 +1248,14 @@
   }
 
   function metaDl(s) {
+    if (s.kind === "group") {
+      const dl = document.createElement("dl");
+      const failed = s.children.filter((c) => c.status === "failed").length;
+      [["tool", s.children[0].name], ["calls", s.children.length], ["failed", failed], ["started", s.start != null ? new Date(s.start).toISOString() : null]]
+        .filter(([, v]) => v != null)
+        .forEach(([k, v]) => { const dt = document.createElement("dt"); dt.textContent = k; const dd = document.createElement("dd"); dd.textContent = String(v); dl.append(dt, dd); });
+      return dl;
+    }
     if (s.kind === "node") {
       const dl = infoDl(s.node, s.nodeId);
       const rec = records.get(s.nodeId);
@@ -1328,18 +1618,21 @@
     const entry = index.get(id);
     if (!entry) return;
     pathTo(id).forEach((a) => {
-      const c = treeEl.querySelector(`.node[data-id="${a.id}"] > .count`);
-      if (c) c.textContent = countDescendants(a);
+      const c = rowEl(a.id)?.querySelector(".count");
+      if (c) c.textContent = countDescendants(soloAgent(a) || a);
     });
-    const row = treeEl.querySelector(`.node[data-id="${id}"]`);
+    const row = rowEl(id);
     if (!row) return;
     const depth = pathTo(id).length - 1;
     const opts = { openDepth: defaultOpenDepth() };
+    const agent = soloAgent(entry.node);
+    // A step changes between a merged "step › agent" row and a plain one when its children change.
+    const changedMerge = row.dataset.id === id && (row.dataset.agentId || null) !== (agent?.id || null);
     const details = row.parentElement.tagName === "SUMMARY" ? row.parentElement.parentElement : null;
-    if (!details) { row.closest("li").replaceWith(buildNode(entry.node, depth, opts)); return; }
+    if (changedMerge || !details) { row.closest("li").replaceWith(buildNode(entry.node, depth, { openIds: new Set(openTreeIds()) })); return; }
     if (!details.dataset.built) return;
     const ul = details.querySelector(":scope > ul");
-    entry.node.children.slice(ul.children.length).forEach((k) => ul.append(buildNode(k, depth + 1, opts)));
+    (agent || entry.node).children.slice(ul.children.length).forEach((k) => ul.append(buildNode(k, depth + 1, opts)));
   }
 
   // Load a new version of the same run without losing the user's place: selection, focus, open
@@ -1741,7 +2034,7 @@
       pathTo(id).slice(0, -1).forEach((a) => openIds.add(a.id));
       render({ openIds });
       showPanel(id);
-      treeEl.querySelector(`.node[data-id="${id}"]`)?.scrollIntoView({ block: "nearest" });
+      rowEl(id)?.scrollIntoView({ block: "nearest" });
     }
   }
 
@@ -1971,7 +2264,8 @@
     $("#search").value = "";
     if (e.target.value === "live") { startLive(); return; }
     stopLive();
-    load(e.target.value === "large" ? window.makeLargeWorkflow() : window.buildWorkflowFromTrace(window.FINAL_OUTPUT));
+    if (e.target.value === "large") { load(window.makeLargeWorkflow()); return; }
+    load(window.buildWorkflowFromTrace(e.target.value === "production" ? window.PRODUCTION_OUTPUT : window.FINAL_OUTPUT));
   });
 
   let searchTimer;
