@@ -389,12 +389,16 @@
         (meta && !useCols() ? `<span class="meta"></span>` : "") +
         `<span class="badges">${badgesHtml(rec)}</span>` +
       `</span>`;
-    if (!agent) row.querySelector(".name").textContent = node.name;
-    else {
+    if (kids.length) row.classList.add("group-row");
+    // Names may be cut short, so the label's hover text always has them in full.
+    const labelEl = row.querySelector(".label");
+    if (!agent) {
+      row.querySelector(".name").textContent = node.name;
+      labelEl.title = `${node.type[0].toUpperCase() + node.type.slice(1)}: ${node.name}`;
+    } else {
       row.querySelector(".step-part").textContent = node.name;
-      row.querySelector(".step-part").title = `Step: ${node.name} (click to select the step)`;
       row.querySelector(".agent-part").textContent = agent.name;
-      row.querySelector(".agent-part").title = `Agent: ${agent.name}`;
+      labelEl.title = `Step: ${node.name}\nAgent: ${agent.name}\n\nClick the step name to select the step`;
     }
     row.querySelector(".meta")?.append(meta);
     addFocusButton(row, node, body);
@@ -428,7 +432,8 @@
         typeTag(node) + `<span class="name"></span>` + (meta ? `<span class="meta"></span>` : "") +
         `<span class="badges">${badgesHtml(rec)}</span>` + count;
     row.querySelector(".name").textContent = node.name;
-    if (agent) { row.querySelector(".name").title = node.name; row.querySelector(".agent-part").textContent = agent.name; }
+    row.querySelector(".name").title = node.name;
+    if (agent) { row.querySelector(".agent-part").textContent = agent.name; row.querySelector(".agent-part").title = agent.name; }
     if (meta) row.querySelector(".meta").textContent = meta;
     addFocusButton(row, node, body);
     return row;

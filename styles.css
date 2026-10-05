@@ -178,8 +178,16 @@ details[open] > summary .chev { transform: rotate(90deg); }
 /* One-line merged rows (Compact path / Agent first) */
 .label { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 6px; overflow: hidden; }
 .label .name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.label .name.minor { font-weight: 400; color: var(--muted); flex: 0 3 auto; min-width: 3ch; }
-.label .agent-part { min-width: 6ch; }
+.label .name.minor { font-weight: 400; color: var(--muted); }
+/* When a merged row is short of space, the step name (or the "in <step>" note) gives way first:
+   it is capped at 40% of the name area and shrinks far faster than the agent name, down to ~8 chars. */
+.label .step-part, .label .ctx { flex: 0 100 auto; max-width: 40%; min-width: 8ch; }
+.label .agent-part { flex: 0 1 auto; }
+/* Rows that hold other rows read like descriptions, so their names may take two lines. */
+.group-row .label .name, .group-row .label .ctx {
+  white-space: normal; overflow-wrap: anywhere; line-height: 1.3;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+}
 .label .sep { color: var(--muted); flex: none; }
 .ico { flex: none; width: 14px; text-align: center; color: var(--tc); font-size: 12px; }
 .ctx { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 0 1 auto; }
