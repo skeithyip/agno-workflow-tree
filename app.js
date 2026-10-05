@@ -80,6 +80,7 @@
     selectedId = null;
     nextId = 0;
     chosen = null;
+    closePauseDialog(); // its pause entry is about to be replaced
     (function walk(node, parent) {
       node.id = "n" + nextId++;
       index.set(node.id, { node, parent });
@@ -271,6 +272,7 @@
     updateStats();
     updateWaiting();
     if (live) (view === "trace" ? traceComposer : treeComposer).update(); // recipients' statuses may have changed
+    syncDialog();
   }
 
   // ---------- header ----------
@@ -459,7 +461,7 @@
     const tl = document.createElement("div");
     tl.className = "timeline";
 
-    panelEl.replaceChildren(h, sub, info, head, hidden, tl, treePause.el, treeComposer.el);
+    panelEl.replaceChildren(treePause.el, h, sub, info, head, hidden, tl, treeComposer.el);
     renderPanelLive();
     tl.scrollTop = 0; // start at the first event; live updates still stick to the bottom
   }
@@ -584,6 +586,14 @@
         (e.start && e.end ? ` <span class="muted">after ${fmtDur(e.end - e.start)}</span>` : "") + `</div><p class="txt"></p>`;
       el.querySelector("code").textContent = e.toolName || "tool";
       el.querySelector(".txt").textContent = e.status === "open" ? e.prompt : pauseSummary(e);
+      if (e.status === "open" && live && !live.done) {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "linkish";
+        b.dataset.review = e.pauseId;
+        b.textContent = "Review";
+        el.querySelector(".h-head").append(b);
+      }
       return;
     } else if (e.kind === "error") {
       el.innerHTML = who(e) + `⚠ <span class="txt"></span>`;
@@ -939,7 +949,7 @@
       if (s.kind === "node") return `This trace doesn't record inputs for ${s.node.type} spans.`;
       return `${s.kind === "reasoning" ? "Reasoning" : "An error"} has no separate input; see Output.`;
     }
-    if (s.kind === "pause") return live && !live.done ? "Waiting for a decision. Answer in the card below." : "No decision was recorded.";
+    if (s.kind === "pause") return live && !live.done ? "Waiting for a decision. Use Review above to answer." : "No decision was recorded.";
     if (s.kind === "human") {
       const e = s.entry;
       const after = e.start && e.end ? ` ${fmtDur(e.end - e.start)} after it was sent` : "";
@@ -1682,10 +1692,12 @@
   spanPanel.append(traceComposer.el);
 
   // ---------- approvals ----------
-  // When an agent pauses before a tool call, a card under the detail panel asks for a decision:
-  // Approve / Reject for an approval, or fields with Submit / Skip call for an input request. The
-  // header button counts waiting agents and jumps between them. Answers are POSTed to
-  // <run>/pauses/<id>; the card closes when the stream reports the pause resolved, by anyone.
+  // When an agent pauses before a tool call, a slim banner at the top of the detail panel says
+  // so, and "Review" (there, on the request in the Events list, or the header button) opens a
+  // dialog with the request, the tool call, the agent's recent activity and the answer form:
+  // Approve / Reject, or fields with Submit / Skip call. The panel keeps its full height for
+  // events; the form only takes space while you are deciding. Answers are POSTed to
+  // <run>/pauses/<id>; if someone else answers first, the dialog says so.
 
   const pauseDrafts = new Map(); // pause_id -> { values, note } typed but not yet sent
   const baseTitle = document.title;
@@ -1706,12 +1718,14 @@
     document.title = openPauses.size ? `(${openPauses.size}) ${baseTitle}` : baseTitle;
   }
 
-  // Next waiting agent after the selected one.
+  // Header button: the next waiting agent after the selected one, with its request open.
   $("#waitingBtn").addEventListener("click", () => {
     const list = [...openPauses.values()];
     if (!list.length) return;
     const i = list.findIndex((e) => e.nodeId === selectedId);
-    reveal(list[(i + 1) % list.length]);
+    const pause = list[(i + 1) % list.length];
+    reveal(pause);
+    openPauseDialog(pause);
   });
 
   function reveal(pause) {
@@ -1729,112 +1743,191 @@
       showPanel(id);
       treeEl.querySelector(`.node[data-id="${id}"]`)?.scrollIntoView({ block: "nearest" });
     }
-    (view === "trace" ? tracePause : treePause).focus();
   }
 
-  function createPauseCard() {
-    const el = document.createElement("section");
-    el.className = "pause-card";
+  // "Review" on a pause entry in the Events list.
+  panelEl.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-review]");
+    const pause = b && openPauses.get(b.dataset.review);
+    if (pause) openPauseDialog(pause);
+  });
+
+  // ----- banner -----
+
+  function createPauseBanner() {
+    const el = document.createElement("div");
+    el.className = "pause-banner";
+    el.setAttribute("role", "status");
     el.hidden = true;
+    el.innerHTML = `<span class="pb-text"></span><button type="button" class="primary pb-review">Review</button>`;
+    const text = el.querySelector(".pb-text");
+    const btn = el.querySelector("button");
     let pause = null;
-    let form, msg, buttons;
+    btn.addEventListener("click", () => { if (pause) openPauseDialog(pause); });
 
-    function build() {
-      const p = pause;
-      const draft = pauseDrafts.get(p.pauseId) || { values: {}, note: "" };
-      const input = p.pauseKind === "input";
-      el.innerHTML =
-        `<div class="pc-badge">⏸ ${input ? "Input needed" : "Approval needed"}</div><p class="pc-prompt"></p>` +
-        `<details class="pc-call"><summary>Tool call: <code></code></summary><pre></pre></details>` +
-        `<form class="pc-form"><div class="pc-fields"></div>` +
-        `<label><span>Note <span class="muted">(optional)</span></span><input name="note" maxlength="500" autocomplete="off"></label>` +
-        `<div class="pc-actions"><span class="pc-msg"></span>` +
-        `<button type="button" data-decision="reject">${input ? "Skip call" : "Reject"}</button>` +
-        `<button type="submit" class="primary" data-decision="${input ? "submit" : "approve"}">${input ? "Submit" : "Approve"}</button></div></form>`;
-      el.querySelector(".pc-prompt").textContent = p.prompt;
-      el.querySelector(".pc-call code").textContent = p.toolName || "tool";
-      el.querySelector(".pc-call pre").textContent = p.toolArgs == null ? "(no arguments)" : fmtVal(p.toolArgs);
-      el.querySelector(".pc-call").open = !input; // an approval is about these arguments, so show them
-      form = el.querySelector("form");
-      msg = el.querySelector(".pc-msg");
-      buttons = el.querySelectorAll("button");
-      const fieldsEl = el.querySelector(".pc-fields");
-      p.fields.forEach((f) => {
-        const label = document.createElement("label");
-        label.textContent = f.description || f.name;
-        const inp = document.createElement("input");
-        inp.name = "field:" + f.name;
-        inp.required = !!f.required;
-        inp.maxLength = 1000;
-        inp.autocomplete = "off";
-        inp.value = draft.values[f.name] ?? f.default ?? "";
-        label.append(inp);
-        fieldsEl.append(label);
-      });
-      form.elements.note.value = draft.note;
-      form.addEventListener("input", () => pauseDrafts.set(p.pauseId, collect()));
-      form.addEventListener("submit", (e) => { e.preventDefault(); send(input ? "submit" : "approve"); });
-      el.querySelector('[data-decision="reject"]').addEventListener("click", () => send("reject"));
-    }
-
-    function collect() {
-      const values = {};
-      pause.fields.forEach((f) => { values[f.name] = form.elements["field:" + f.name].value; });
-      return { values, note: form.elements.note.value };
-    }
-
-    async function send(decision) {
-      const p = pause;
-      if (!p || p.sending || !live || live.done) return;
-      if (decision === "submit" && !form.reportValidity()) return;
-      const { values, note } = collect();
-      p.sending = decision;
-      p.error = null;
-      sync();
-      try {
-        const r = await fetch(liveEndpoint("pauses/" + encodeURIComponent(p.pauseId)), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ decision, values: decision === "submit" ? values : undefined, note: note.trim() || undefined, author: viewerName() }),
-        });
-        if (!r.ok) throw new Error((await r.json().catch(() => null))?.error || `HTTP ${r.status}`);
-        pauseDrafts.delete(p.pauseId); // stays "Sending…" until the stream reports it resolved
-      } catch (err) {
-        p.sending = null;
-        p.error = errText(err);
-      }
-      if (pause === p) sync();
-    }
-
-    function sync() {
-      const p = pause;
-      const ended = !live || live.done;
-      el.querySelectorAll("input, button").forEach((c) => { c.disabled = !!p.sending || ended; });
-      msg.textContent = p.error || (p.sending ? "Sending…" : ended ? "The run has ended." : "");
-      msg.className = "pc-msg" + (p.error ? " err" : " muted");
-    }
-
-    // Shows the oldest open pause of node `id`, if any. The form is only rebuilt when the pause
-    // shown changes, so typing survives live redraws.
+    // Shows the oldest open request of node `id`, if any.
     function update(id) {
-      const next = id ? [...openPauses.values()].find((e) => e.nodeId === id) : null;
-      if (!next) { pause = null; el.hidden = true; el.replaceChildren(); return; }
-      if (next !== pause) { pause = next; build(); }
-      el.hidden = false;
-      sync();
+      const mine = id ? [...openPauses.values()].filter((e) => e.nodeId === id) : [];
+      pause = mine[0] || null;
+      el.hidden = !pause;
+      if (!pause) return;
+      text.innerHTML =
+        `⏸ <strong>${pause.pauseKind === "input" ? "Input needed" : "Approval needed"}</strong> · <code>${escapeHtml(pause.toolName || "tool")}</code>` +
+        (mine.length > 1 ? ` <span class="muted">+${mine.length - 1} more</span>` : "") +
+        (pause.sending ? ` <span class="muted">· answer sent…</span>` : "");
+      btn.disabled = !!pause.sending;
     }
-
-    function focus() {
-      if (!pause || el.hidden) return;
-      (el.querySelector(".pc-fields input") || el.querySelector('button[type="submit"]'))?.focus();
-    }
-
-    return { el, update, focus };
+    return { el, update };
   }
 
-  const treePause = createPauseCard();
-  const tracePause = createPauseCard();
-  spanPanel.insertBefore(tracePause.el, traceComposer.el);
+  const treePause = createPauseBanner();
+  const tracePause = createPauseBanner();
+  spanPanel.insertBefore(tracePause.el, detailEl);
+
+  // ----- dialog -----
+
+  const RECENT = 6; // entries of the agent's activity shown for context
+  const dlg = document.createElement("dialog");
+  dlg.className = "pause-dialog";
+  dlg.setAttribute("aria-labelledby", "pd-title");
+  document.body.append(dlg);
+  let dlgPause = null;
+  let dlgReturn = null; // element to give focus back to on close
+  let dlgSig = "";
+
+  dlg.addEventListener("close", () => {
+    dlgPause = null;
+    dlgReturn?.isConnected && dlgReturn.focus();
+    dlgReturn = null;
+  });
+  // Clicking the backdrop (the dialog element itself, outside its content) closes it.
+  dlg.addEventListener("click", (e) => { if (e.target === dlg) dlg.close(); });
+
+  function openPauseDialog(pause) {
+    dlgReturn = document.activeElement;
+    dlgPause = pause;
+    dlgSig = "";
+    buildDialog();
+    if (!dlg.open) dlg.showModal();
+    syncDialog();
+    (dlg.querySelector(".pd-fields input") || dlg.querySelector('button[type="submit"]'))?.focus();
+  }
+
+  function closePauseDialog() { if (dlg.open) dlg.close(); }
+
+  // One line per recent entry, for context: what the agent did just before asking.
+  function entryLine(e) {
+    const first = (t) => String(t || "").split("\n")[0].slice(0, 140);
+    switch (e.kind) {
+      case "tool": return `🔧 ${e.name || "tool"} · ${e.status === "running" ? "running" : e.status === "failed" ? "error" : e.end && e.start ? fmtDur(e.end - e.start) : "done"}`;
+      case "reasoning": return `💭 ${first(e.steps[e.steps.length - 1]) || "Reasoning"}`;
+      case "content": return `📝 ${first(e.text) || "structured output"}`;
+      case "human": return `💬 ${authorLabel(e)}: ${first(e.text)}`;
+      case "pause": return `⏸ ${e.pauseKind === "input" ? "Input" : "Approval"} for ${e.toolName || "tool"} · ${(PAUSE_STATE[e.status] || {}).label}`;
+      default: return `⚠ ${first(e.text)}`;
+    }
+  }
+
+  function buildDialog() {
+    const p = dlgPause;
+    const node = index.get(p.nodeId)?.node;
+    const input = p.pauseKind === "input";
+    const draft = pauseDrafts.get(p.pauseId) || { values: {}, note: "" };
+    dlg.innerHTML =
+      `<form class="pd-form">` +
+        `<div class="pd-head"><h2 id="pd-title"></h2><button type="button" class="linkish pd-close" aria-label="Close">✕</button></div>` +
+        `<p class="pd-prompt"></p><div class="pd-fields"></div>` +
+        `<details class="pd-call"><summary>Tool call: <code></code></summary><pre></pre></details>` +
+        `<details class="pd-recent" open><summary>Recent activity</summary><ol></ol></details>` +
+        `<label class="pd-note"><span>Note <span class="muted">(optional)</span></span><input name="note" maxlength="500" autocomplete="off"></label>` +
+        `<div class="pd-actions"><span class="pd-msg"></span>` +
+          `<button type="button" data-decision="reject">${input ? "Skip call" : "Reject"}</button>` +
+          `<button type="submit" class="primary">${input ? "Submit" : "Approve"}</button></div>` +
+      `</form>`;
+    dlg.querySelector("h2").textContent = `${input ? "Input needed" : "Approval needed"} · ${node ? node.name : "agent"}`;
+    dlg.querySelector(".pd-prompt").textContent = p.prompt;
+    dlg.querySelector(".pd-call code").textContent = p.toolName || "tool";
+    dlg.querySelector(".pd-call pre").textContent = p.toolArgs == null ? "(no arguments)" : fmtVal(p.toolArgs);
+    dlg.querySelector(".pd-call").open = !input; // an approval is about these arguments
+    const fieldsEl = dlg.querySelector(".pd-fields");
+    p.fields.forEach((f) => {
+      const label = document.createElement("label");
+      const span = document.createElement("span");
+      span.textContent = f.description || f.name;
+      const inp = document.createElement("input");
+      inp.name = "field:" + f.name;
+      inp.required = !!f.required;
+      inp.maxLength = 1000;
+      inp.autocomplete = "off";
+      inp.value = draft.values[f.name] ?? f.default ?? "";
+      label.append(span, inp);
+      fieldsEl.append(label);
+    });
+    const form = dlg.querySelector("form");
+    form.elements.note.value = draft.note;
+    form.addEventListener("input", () => pauseDrafts.set(p.pauseId, collectDialog()));
+    form.addEventListener("submit", (e) => { e.preventDefault(); sendDecision(input ? "submit" : "approve"); });
+    dlg.querySelector('[data-decision="reject"]').addEventListener("click", () => sendDecision("reject"));
+    dlg.querySelector(".pd-close").addEventListener("click", () => dlg.close());
+  }
+
+  function collectDialog() {
+    const form = dlg.querySelector("form");
+    const values = {};
+    dlgPause.fields.forEach((f) => { values[f.name] = form.elements["field:" + f.name].value; });
+    return { values, note: form.elements.note.value };
+  }
+
+  // Keeps the dialog in step with the run: recent activity, sending state, and an answer that
+  // arrived from someone else. Called on every redraw while it is open.
+  function syncDialog() {
+    const p = dlgPause;
+    if (!dlg.open || !p) return;
+    const rec = records.get(p.nodeId);
+    const recent = rec ? rec.entries.filter((e) => e !== p).slice(-RECENT) : [];
+    const sig = recent.map((e) => `${e.uid}.${e.ver}`).join(",");
+    if (sig !== dlgSig) {
+      dlgSig = sig;
+      const ol = dlg.querySelector(".pd-recent ol");
+      ol.replaceChildren(...recent.map((e) => { const li = document.createElement("li"); li.textContent = entryLine(e); return li; }));
+      if (!recent.length) ol.innerHTML = `<li class="muted">Nothing yet.</li>`;
+    }
+    const resolved = p.status !== "open";
+    const ended = !live || live.done;
+    dlg.querySelectorAll(".pd-form input, .pd-actions button").forEach((c) => { c.disabled = resolved || !!p.sending || ended; });
+    const msg = dlg.querySelector(".pd-msg");
+    msg.textContent = resolved ? `${pauseSummary(p)}.` : p.error || (p.sending ? "Sending…" : ended ? "The run has ended." : "");
+    msg.className = "pd-msg" + (p.error && !resolved ? " err" : resolved ? "" : " muted");
+    dlg.classList.toggle("resolved", resolved);
+  }
+
+  async function sendDecision(decision) {
+    const p = dlgPause;
+    if (!p || p.sending || p.status !== "open" || !live || live.done) return;
+    const form = dlg.querySelector("form");
+    if (decision === "submit" && !form.reportValidity()) return;
+    const { values, note } = collectDialog();
+    p.sending = decision;
+    p.error = null;
+    syncDialog();
+    drawNow(p.nodeId);
+    try {
+      const r = await fetch(liveEndpoint("pauses/" + encodeURIComponent(p.pauseId)), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision, values: decision === "submit" ? values : undefined, note: note.trim() || undefined, author: viewerName() }),
+      });
+      if (!r.ok) throw new Error((await r.json().catch(() => null))?.error || `HTTP ${r.status}`);
+      pauseDrafts.delete(p.pauseId);
+      if (dlgPause === p) dlg.close(); // the banner shows "answer sent…" until the stream confirms
+    } catch (err) {
+      p.sending = null;
+      p.error = errText(err);
+      syncDialog();
+      drawNow(p.nodeId);
+    }
+  }
+
 
   // ---------- helpers ----------
 
