@@ -256,6 +256,14 @@
           rec.openPauses = Math.max(0, rec.openPauses - 1);
         }
       }
+    } else if (t === "model_request") {
+      // One model reply. It starts a new turn in the trace view; it is not a node lifecycle event,
+      // even though its event name ends in ".completed".
+      addEntry(id, {
+        kind: "model", model: evt.model_name || evt.model, inputTokens: evt.input_tokens, outputTokens: evt.output_tokens,
+        reasoningTokens: evt.reasoning_tokens, cacheReadTokens: evt.cache_read_tokens, cost: evt.cost,
+        ts: ms(evt.timestamp || evt.completed_at || evt.started_at),
+      });
     } else if (t === "content") {
       const structured = evt.content_type && evt.content_type !== "str" ? evt.data : null;
       addEntry(id, { kind: "content", text: evt.text || "", data: structured, contentType: evt.content_type, ts: ms(evt.completed_at || evt.started_at) });
@@ -740,6 +748,8 @@
       if (m.total_tokens != null) add("tokens", `${fmtTokens(m.input_tokens)} in / ${fmtTokens(m.output_tokens)} out`);
       if (m.time_to_first_token != null) add("time to first token", fmtDur(m.time_to_first_token * 1000));
     }
+    const tools = records.get(id)?.entries.filter((e) => e.kind === "tool") || [];
+    if (tools.length) add("tools used", toolTally(tools));
     add("started", node.started_at);
     add("completed", node.completed_at);
     add("path", pathTo(id).map((x) => x.name).join(" › "));
@@ -910,8 +920,9 @@
   const ROW_H = 28;          // must match .span height in styles.css
   const OVERSCAN = 8;        // extra rows drawn above and below the viewport
   const MAX_CHARS = 20000;   // longer values are cut until "Show all" is clicked
-  const LEAF_ICON = { tool: "🔧", group: "🔧", reasoning: "💭", error: "⚠", human: "💬", pause: "⏸" };
-  const GROUP_MIN = 3;       // this many consecutive same-name tool calls share one group row
+  const LEAF_ICON = { tool: "🔧", turn: "↻", turns: "↻", reasoning: "💭", error: "⚠", human: "💬", pause: "⏸" };
+  const FOLD_MIN = 3;        // this many consecutive turns that called the same tools fold into one row
+  const SLOW_MS = 10000;     // a tool call this long is flagged slow, and its turn opens by default
 
   const treeViewEl = $("#treeView");
   const traceViewEl = $("#traceView");
@@ -934,6 +945,8 @@
   let errorsOnly = false;
   let detailTab = "output";
   let fullShown = new Set(); // "spanId:tab:section" keys whose value is shown uncut
+  let autoOpened = new Set(); // turn ids already opened by default, so closing one keeps it closed
+  let traceShut = new Set();  // running turns the user closed (they open by default while running)
 
   function resetTrace() {
     traceSel = null;
@@ -943,6 +956,8 @@
     rows = [];
     fullShown = new Set();
     traceOpen = defaultOpenIds();
+    autoOpened = new Set();
+    traceShut = new Set();
     spanScroll.scrollTop = 0;
     if (view === "trace") renderTrace();
   }
@@ -954,30 +969,78 @@
     let tMin = Infinity, tMax = -Infinity;
     const see = (t) => { if (t != null) { tMin = Math.min(tMin, t); tMax = Math.max(tMax, t); } };
 
-    // Runs of GROUP_MIN or more consecutive calls to the same tool become one collapsed row, so a
-    // step that made dozens of identical calls reads as a single line until it is opened.
-    function groupToolRuns(kids, parent, depth) {
+    // An agent works in turns: the model replies, then runs a batch of tool calls. Each turn
+    // becomes one row holding its calls (and any reasoning, pauses or messages that arrived during
+    // it); the model's reply text and token use are the turn's own output and metadata. Nodes with
+    // no model_request events fall back to content events as turn boundaries.
+    function buildTurns(node, s, depth, leaves) {
+      const entries = records.get(node.id).entries;
+      const boundary = entries.some((e) => e.kind === "model") ? "model" : "content";
+      if (!entries.some((e) => e.kind === boundary) || !entries.some((e) => e.kind === "tool")) return leaves; // turns only help where tools ran
+      const leafOf = new Map(leaves.map((l) => [l.entry, l]));
+      const out = [];
+      let turn = null, n = 0;
+      const startTurn = () => {
+        turn = { id: `turn:${node.id}:${n}`, kind: "turn", n: ++n, nodeId: node.id, depth, parent: s, children: [], model: null, content: [] };
+        out.push(turn);
+      };
+      entries.forEach((e) => {
+        if (e.kind === boundary) startTurn();
+        if (e.kind === "model") { turn.model = e; return; }
+        if (e.kind === "content") { if (turn) turn.content.push(e); return; }
+        const leaf = leafOf.get(e);
+        if (!leaf) return;
+        if (!turn) { out.push(leaf); return; } // before the first reply
+        leaf.parent = turn; leaf.depth = depth + 1;
+        turn.children.push(leaf);
+      });
+      out.forEach((t) => { if (t.kind === "turn") finishTurn(t); });
+      return foldTurns(out, s, depth);
+    }
+
+    function finishTurn(t) {
+      const tools = t.children.filter((c) => c.kind === "tool");
+      t.children.sort((a, b) => (a.start ?? Infinity) - (b.start ?? Infinity));
+      const times = [t.model?.ts, ...t.content.map((c) => c.ts), ...t.children.flatMap((c) => [c.start, c.end])].filter((x) => x != null);
+      const firstContent = t.content.find((c) => c.ts != null);
+      t.start = Math.min(...[firstContent?.ts, t.model?.ts, ...t.children.map((c) => c.start)].filter((x) => x != null));
+      if (!isFinite(t.start)) t.start = null;
+      const running = t.children.some((c) => c.status === "running" || c.status === "waiting");
+      t.end = running || !times.length ? null : Math.max(...times);
+      t.status = t.children.some((c) => c.status === "failed") ? "failed" : t.children.some((c) => c.status === "waiting") ? "waiting" : running ? "running" : "done";
+      t.hasError = t.status === "failed";
+      t.children.forEach((c) => { c.hasError = c.status === "failed"; });
+      t.live = running;
+      t.slow = tools.some((c) => c.slow);
+      t.parallel = overlaps(tools);
+      t.sig = tools.map((c) => c.label).sort().join("|");
+      t.name = `Turn ${t.n} · ` + turnSummary(tools, t.parallel);
+      // Turns worth looking at open by default, once: a failure or a slow call. A running turn is
+      // open only while it runs (see isOpen).
+      if ((t.hasError || t.slow) && !autoOpened.has(t.id)) { autoOpened.add(t.id); traceOpen.add(t.id); }
+    }
+
+    // Back-to-back turns that called the same tools, with nothing notable in them, fold into one row.
+    function foldTurns(items, s, depth) {
       const out = [];
       let i = 0;
-      while (i < kids.length) {
+      const plain = (x) => x.kind === "turn" && x.status === "done" && !x.slow && x.sig;
+      while (i < items.length) {
         let j = i + 1;
-        if (kids[i].kind === "tool") while (j < kids.length && kids[j].kind === "tool" && kids[j].name === kids[i].name) j++;
-        if (j - i < GROUP_MIN) { out.push(kids[i]); i++; continue; }
-        const run = kids.slice(i, j);
-        const status = run.some((c) => c.status === "failed") ? "failed" : run.some((c) => c.status === "running") ? "running" : "done";
-        const starts = run.map((c) => c.start).filter((t) => t != null);
-        const ends = run.map((c) => c.end ?? c.start).filter((t) => t != null);
-        const g = {
-          id: "g:" + run[0].id, kind: "group", name: `${run[0].name} ×${run.length}`, nodeId: parent.nodeId,
-          depth, parent, children: run, status, hasError: status === "failed",
-          start: starts.length ? Math.min(...starts) : null,
-          end: status === "running" || !ends.length ? null : Math.max(...ends),
+        if (plain(items[i])) while (j < items.length && plain(items[j]) && items[j].sig === items[i].sig) j++;
+        if (j - i < FOLD_MIN) { out.push(items[i]); i++; continue; }
+        const run = items.slice(i, j);
+        const f = {
+          id: `turns:${run[0].id}`, kind: "turns", nodeId: s.nodeId, depth, parent: s, children: run, status: "done", hasError: false,
+          start: run[0].start, end: run.at(-1).end,
+          name: `Turns ${run[0].n}–${run.at(-1).n} · ${run.length}× ${run[0].name.replace(/^Turn \d+ · /, "")}`,
         };
-        run.forEach((c) => { c.parent = g; c.depth = depth + 1; c.hasError = c.status === "failed"; });
-        spans.set(g.id, g);
-        out.push(g);
+        run.forEach((t) => { t.parent = f; t.depth = depth + 1; t.children.forEach((c) => { c.depth = depth + 2; }); });
+        spans.set(f.id, f);
+        out.push(f);
         i = j;
       }
+      out.forEach((x) => { if (x.kind === "turn") spans.set(x.id, x); else if (x.kind === "turns") x.children.forEach((t) => spans.set(t.id, t)); });
       return out;
     }
 
@@ -1007,8 +1070,10 @@
         see(leaf.start); see(leaf.end);
         kids.push(leaf);
       });
-      kids.sort((a, b) => (a.start ?? Infinity) - (b.start ?? Infinity));
-      s.children = groupToolRuns(kids, s, depth + 1);
+      const childNodes = kids.filter((k) => k.kind === "node");
+      const leaves = kids.filter((k) => k.kind !== "node");
+      s.children = [...childNodes, ...buildTurns(node, s, depth + 1, leaves)];
+      s.children.sort((a, b) => (a.start ?? Infinity) - (b.start ?? Infinity));
       s.hasError = s.status === "failed" || s.children.some((k) => k.hasError || k.status === "failed");
       s.children.forEach((k) => { if (k.hasError === undefined) k.hasError = k.status === "failed"; });
       return s;
@@ -1023,7 +1088,12 @@
 
   function leafLabel(e) {
     switch (e.kind) {
-      case "tool": return { name: e.name || "tool", status: e.status };
+      case "tool": {
+        const label = toolLabel(e);
+        const purpose = typeof e.args?.purpose === "string" ? e.args.purpose.split("\n")[0].slice(0, 120) : "";
+        const slow = e.start != null && e.end != null && e.end - e.start >= SLOW_MS;
+        return { name: label + (purpose ? ` · ${purpose}` : ""), label, status: e.status, slow };
+      }
       case "reasoning": return { name: "Reasoning", status: e.done ? "done" : "running" };
       case "pause": return { name: `${e.pauseKind === "input" ? "Input" : "Approval"}: ${e.toolName || "tool"}`, status: (PAUSE_STATE[e.status] || PAUSE_STATE.open).dot };
       case "human": return { name: `${authorLabel(e)}: ${e.text.split("\n")[0].slice(0, 120)}`, status: (HUMAN_STATE[e.status] || HUMAN_STATE.queued).dot };
@@ -1031,7 +1101,7 @@
     }
   }
 
-  const isOpen = (s) => errorsOnly || traceOpen.has(s.id);
+  const isOpen = (s) => errorsOnly || traceOpen.has(s.id) || (s.live && !traceShut.has(s.id));
 
   function flattenRows() {
     rows = [];
@@ -1074,7 +1144,7 @@
 
   function renderSummary() {
     let errs = 0;
-    spans.forEach((s) => { if (s.status === "failed") errs++; });
+    spans.forEach((s) => { if (s.status === "failed" && s.kind !== "turn" && s.kind !== "turns") errs++; });
     $("#traceSummary").textContent = `${spans.size} spans · ${errs} error${errs === 1 ? "" : "s"}`;
     $("#traceSummary").classList.toggle("has-err", errs > 0);
   }
@@ -1096,7 +1166,7 @@
   function spanRow(s, i) {
     const row = document.createElement("div");
     const open = s.children.length ? isOpen(s) : null;
-    row.className = `span st-${s.status}` + (s.id === traceSel ? " selected" : "") + (traceHits && traceHits.has(s.id) ? " hit" : "") +
+    row.className = `span st-${s.status}` + (s.slow ? " slow" : "") + (s.id === traceSel ? " selected" : "") + (traceHits && traceHits.has(s.id) ? " hit" : "") +
       (chosen && chosen.has(s.id) ? " recipient" : "");
     row.style.top = i * ROW_H + "px";
     row.dataset.id = s.id;
@@ -1111,7 +1181,7 @@
         spanTag(s) + `<span class="name"></span>` +
       `</div><div class="span-dur">${dur}</div><div class="span-bar-cell">${barHtml(s)}</div>`;
     row.querySelector(".name").textContent = s.name;
-    row.title = s.name;
+    row.title = s.name + (s.slow && s.kind === "tool" ? " (slow)" : "");
     return row;
   }
 
@@ -1126,7 +1196,7 @@
     const end = s.end ?? (s.status === "running" || s.status === "waiting" ? win.t1 : s.start);
     const left = Math.min(100, Math.max(0, ((s.start - win.t0) / span) * 100));
     const width = Math.min(100 - left, Math.max(0, ((end - s.start) / span) * 100));
-    const cls = s.kind === "node" ? `k-node t-${s.node.type}` : `k-${s.kind === "group" ? "tool" : s.kind}`;
+    const cls = s.kind === "node" ? `k-node t-${s.node.type}` : `k-${s.kind === "turn" || s.kind === "turns" ? "turn" : s.kind}`;
     return `<span class="wf-bar ${cls}" style="left:${left.toFixed(3)}%;width:${width.toFixed(3)}%"></span>`;
   }
 
@@ -1157,9 +1227,9 @@
     selectSpan(rows[n].id, true);
   }
 
-  function toggleSpan(s, open = !traceOpen.has(s.id)) {
+  function toggleSpan(s, open = !isOpen(s)) {
     if (errorsOnly || !s.children.length) return;
-    if (open) traceOpen.add(s.id); else traceOpen.delete(s.id);
+    if (open) { traceOpen.add(s.id); traceShut.delete(s.id); } else { traceOpen.delete(s.id); traceShut.add(s.id); }
     renderTrace({ rebuild: false });
   }
 
@@ -1208,7 +1278,18 @@
   }
 
   function outputOf(s) {
-    if (s.kind === "group") return [{ label: "Calls", value: s.children.map((c) => `${c.name} · ${c.status} · ${c.start != null && c.end != null ? fmtDur(c.end - c.start) || "0ms" : "…"}`).join("\n") }];
+    const callList = (calls) => calls.map((c) => `${c.name} · ${c.status} · ${c.start != null && c.end != null ? fmtDur(c.end - c.start) || "0ms" : "…"}`).join("\n");
+    if (s.kind === "turns") return [{ label: "Turns", value: s.children.map((t) => `${t.name} · ${t.start != null && t.end != null ? fmtDur(t.end - t.start) : "…"}`).join("\n") }];
+    if (s.kind === "turn") {
+      const out = [];
+      s.content.forEach((c) => {
+        if (c.text) out.push({ label: "Model reply", value: c.text });
+        if (c.data) out.push({ label: `Structured output · ${c.contentType}`, value: c.data });
+      });
+      const calls = s.children.filter((c) => c.kind === "tool");
+      if (calls.length) out.push({ label: `Tool calls${s.parallel ? " (ran in parallel)" : ""}`, value: callList(calls) });
+      return out;
+    }
     const e = s.entry;
     if (s.kind === "tool") return e.result !== undefined ? [{ label: s.status === "failed" ? "Error" : "Result", value: e.result }] : [];
     if (s.kind === "reasoning") return e.steps.length ? [{ label: "Reasoning", value: e.steps.join("\n\n") }] : [];
@@ -1234,6 +1315,7 @@
     if (tab === "input") {
       if (s.kind === "tool") return "No arguments were recorded for this call.";
       if (s.kind === "node") return `This trace doesn't record inputs for ${s.node.type} spans.`;
+      if (s.kind === "turn" || s.kind === "turns") return "A turn's input is the conversation so far, which the trace doesn't record. Each tool call's arguments are on the call.";
       return `${s.kind === "reasoning" ? "Reasoning" : "An error"} has no separate input; see Output.`;
     }
     if (s.kind === "pause") return live && !live.done ? "Waiting for a decision. Use Review above to answer." : "No decision was recorded.";
@@ -1253,12 +1335,28 @@
   }
 
   function metaDl(s) {
-    if (s.kind === "group") {
+    if (s.kind === "turn" || s.kind === "turns") {
       const dl = document.createElement("dl");
-      const failed = s.children.filter((c) => c.status === "failed").length;
-      [["tool", s.children[0].name], ["calls", s.children.length], ["failed", failed], ["started", s.start != null ? new Date(s.start).toISOString() : null]]
-        .filter(([, v]) => v != null)
-        .forEach(([k, v]) => { const dt = document.createElement("dt"); dt.textContent = k; const dd = document.createElement("dd"); dd.textContent = String(v); dl.append(dt, dd); });
+      const add = (k, v) => { if (v == null || v === "") return; const dt = document.createElement("dt"); dt.textContent = k; const dd = document.createElement("dd"); dd.textContent = String(v); dl.append(dt, dd); };
+      const turns = s.kind === "turns" ? s.children : [s];
+      const calls = turns.flatMap((t) => t.children.filter((c) => c.kind === "tool"));
+      const models = turns.map((t) => t.model).filter(Boolean);
+      const sum = (k) => models.reduce((a, m) => a + (m[k] || 0), 0);
+      add("kind", s.kind === "turn" ? "model turn" : `${turns.length} similar turns`);
+      add("status", s.status);
+      if (s.start != null && s.end != null) add("duration", fmtDur(s.end - s.start));
+      if (s.start != null) add("offset", "+" + (fmtDur(s.start - win.t0) || "0ms"));
+      add("tool calls", calls.length + (calls.some((c) => c.status === "failed") ? ` (${calls.filter((c) => c.status === "failed").length} failed)` : ""));
+      if (s.kind === "turn") add("calls ran", calls.length < 2 ? null : s.parallel ? "in parallel" : "one after another");
+      add("slow calls", calls.filter((c) => c.slow).length || null);
+      add("tools", toolTally(calls.map((c) => c.entry)));
+      if (models.length) {
+        add("model", [...new Set(models.map((m) => m.model).filter(Boolean))].join(", "));
+        add("tokens", `${fmtTokens(sum("inputTokens"))} in / ${fmtTokens(sum("outputTokens"))} out` + (sum("cacheReadTokens") ? ` · ${fmtTokens(sum("cacheReadTokens"))} cached` : ""));
+        if (models.some((m) => m.cost != null)) add("cost", "$" + sum("cost").toFixed(4));
+      }
+      const node = index.get(s.nodeId).node;
+      add("node", `${node.name} (${node.type})`);
       return dl;
     }
     if (s.kind === "node") {
@@ -2228,6 +2326,43 @@
 
 
   // ---------- helpers ----------
+
+  // The tool a call ran. Calls through a dispatcher tool (one that takes a tool_id argument) are
+  // named after the tool they dispatched to.
+  function toolLabel(e) {
+    const via = e.args && (typeof e.args.tool_id === "string" || typeof e.args.tool_id === "number") ? String(e.args.tool_id) : null;
+    return via || e.name || "tool";
+  }
+
+  // "search ×12 · fetch ×8 · record" — most used first; failures and the rest summarised.
+  function toolTally(toolEntries, max = 6) {
+    const counts = new Map();
+    toolEntries.forEach((e) => { const k = toolLabel(e); counts.set(k, (counts.get(k) || 0) + 1); });
+    const sorted = [...counts].sort((a, b) => b[1] - a[1]);
+    const shown = sorted.slice(0, max).map(([k, c]) => (c > 1 ? `${k} ×${c}` : k));
+    if (sorted.length > max) shown.push(`+${sorted.length - max} more`);
+    const failed = toolEntries.filter((e) => e.status === "failed").length;
+    return shown.join(" · ") + (failed ? ` · ⚠ ${failed} failed` : "");
+  }
+
+  // Short summary of a turn's calls, in the order they were made: "‖ 3 tools · search, fetch ×2".
+  function turnSummary(tools, parallel) {
+    if (!tools.length) return "reply";
+    const counts = new Map();
+    tools.forEach((c) => counts.set(c.label, (counts.get(c.label) || 0) + 1));
+    const names = [...counts].slice(0, 3).map(([k, c]) => (c > 1 ? `${k} ×${c}` : k));
+    if (counts.size > 3) names.push(`+${counts.size - 3}`);
+    const n = tools.length === 1 ? "1 tool" : `${parallel ? "‖ " : ""}${tools.length} tools`;
+    return `${n} · ${names.join(", ")}`;
+  }
+
+  // True when any two calls ran at the same time (more than a few ms of overlap).
+  function overlaps(calls) {
+    const iv = calls.filter((c) => c.start != null).map((c) => [c.start, c.end ?? Infinity]).sort((a, b) => a[0] - b[0]);
+    let end = -Infinity;
+    for (const [a, b] of iv) { if (a < end - 5) return true; end = Math.max(end, b); }
+    return false;
+  }
 
   function fmtDur(ms) {
     if (ms == null || isNaN(ms)) return "";

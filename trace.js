@@ -54,7 +54,7 @@
   // Event timestamp used for ordering and for node start/end.
   function eventTs(ev) {
     if (ev.type === "tool_start") return ms(ev.started_at);
-    return ms(ev.completed_at) || ms(ev.started_at);
+    return ms(ev.completed_at) || ms(ev.started_at) || ms(ev.timestamp); // model_request has only a timestamp
   }
 
   const lifeName = (node, phase) => `${node.type}.${phase}`;

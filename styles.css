@@ -337,6 +337,9 @@ code { font-size: 12px; }
   background: var(--tc, var(--accent));
 }
 .wf-bar.k-tool { background: var(--t-tool); }
+.wf-bar.k-turn { background: color-mix(in srgb, var(--t-tool) 35%, transparent); }
+/* A tool call over SLOW_MS (and the turn holding it) */
+.span.slow .span-dur { color: var(--running); font-weight: 600; }
 .wf-bar.k-reasoning { background: color-mix(in srgb, var(--muted) 55%, transparent); }
 .wf-bar.k-error, .st-failed .wf-bar { background: var(--failed); }
 .st-running .wf-bar {
